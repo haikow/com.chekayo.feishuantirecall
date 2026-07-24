@@ -1,0 +1,10 @@
+{
+  "versionCode": 10,
+  "versionName": "1.6.2",
+  "notice": "",
+  "changelog": "1.6.2：防对方已读升级为「回复才已读」——只看不回=对方未读，回复后才把可视消息标已读（私聊/群聊都覆盖）。",
+  "downloads": [
+    "https://github.com/Xposed-Modules-Repo/com.chekayo.feishuantirecall/releases/latest"
+  ],
+  "channel": "https://t.me/fucklark"
+}
