@@ -1,0 +1,10 @@
+{
+  "versionCode": 12,
+  "versionName": "1.6.4",
+  "notice": "",
+  "changelog": "1.6.4：资料归档升级为「全员档案·自动批量」——直接解析飞书本地资料库，全公司+外部客户资料自动入库（部门/邮箱/工号/职务/上级/手机），离职后存档仍在；新增📇全员档案入口（搜索/分类/开资料页）。",
+  "downloads": [
+    "https://github.com/Xposed-Modules-Repo/com.chekayo.feishuantirecall/releases/latest"
+  ],
+  "channel": "https://t.me/fucklark"
+}
