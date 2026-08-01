@@ -1,8 +1,8 @@
 {
-  "versionCode": 12,
-  "versionName": "1.6.4",
+  "versionCode": 13,
+  "versionName": "1.6.5",
   "notice": "",
-  "changelog": "1.6.4：资料归档升级为「全员档案·自动批量」——直接解析飞书本地资料库，全公司+外部客户资料自动入库（部门/邮箱/工号/职务/上级/手机），离职后存档仍在；新增📇全员档案入口（搜索/分类/开资料页）。",
+  "changelog": "1.6.5：新增「组织架构自动巡游」——在系统无障碍开启后，进【通讯录→组织内联系人】自动走遍全部部门，逼飞书把全员懒加载进本地库，配合资料归档一键收全公司花名册。巡游中按音量键即可暂停；支持断点续跑（点「继续巡游」后从中断部门接着走，不重头）；设置页新增巡游开关 + 停止/继续/从头开始。",
   "downloads": [
     "https://github.com/Xposed-Modules-Repo/com.chekayo.feishuantirecall/releases/latest"
   ],
