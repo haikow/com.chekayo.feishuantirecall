@@ -1,0 +1,10 @@
+{
+  "versionCode": 14,
+  "versionName": "1.6.6",
+  "notice": "",
+  "changelog": "1.6.6：新增「后台消息存档」——后台/离线时对方撤回，服务器不下发原文、SQL 层防撤回救不了，本功能从通知回捞被撤回那条的原文存档（面板📨后台消息存档，需飞书开消息预览，仅文本，默认关）。修复「保留被踢群」误判——同事离职退群不再把你还在的群误记为被踢。「退群/被移出提醒」新增静默检测——公司离职自动退群（不广播系统消息）也能记录是谁离开了哪个群。",
+  "downloads": [
+    "https://github.com/Xposed-Modules-Repo/com.chekayo.feishuantirecall/releases/latest"
+  ],
+  "channel": "https://t.me/fucklark"
+}
