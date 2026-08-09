@@ -1,0 +1,10 @@
+[Unit]
+Description=飞书 asar 自动重打(开机+定时兜底)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30min
+Unit=feishu-autopatch.service
+
+[Install]
+WantedBy=timers.target

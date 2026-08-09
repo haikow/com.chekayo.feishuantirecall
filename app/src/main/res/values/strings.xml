@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="org_walker_desc">fuck lark 组织通讯录自动巡游：进入飞书【通讯录→组织内联系人】时自动 DFS 走遍全部部门，触发懒加载以便全量归档。仅作用于飞书。</string>
+</resources>

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.chekayo.feishuantirecall"
+    android:versionCode="14"
+    android:versionName="1.6.6">
+
+    <uses-sdk android:minSdkVersion="22" android:targetSdkVersion="34" />
+
+    <application
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:label="fuck lark">
+
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription" android:value="fuck lark：飞书防撤回（原文+撤回提示并存，兼容7.70.x）+ 离职同事统计（设置页开关）" />
+        <meta-data android:name="xposedminversion" android:value="82" />
+        <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
+
+        <!-- launcher 占位 Activity: 让模块有桌面图标 + 被系统认作"可启动 app",
+             从而「无障碍 → 已下载的应用」列表能显示「fuck lark 组织巡游」开关条目。
+             启动即跳转到系统无障碍设置页。 -->
+        <activity
+            android:name=".LauncherActivity"
+            android:label="fuck lark"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 组织架构自动巡游:AccessibilityService 跑在模块自己的进程(com.chekayo.feishuantirecall),
+             从外部驱动飞书 UI(进入组织树页时自动 DFS 走遍全部部门,触发懒加载)。
+             用户须在系统「无障碍」里手动开启本服务;开启后仅作用于飞书(见 xml 配置 packageNames)。 -->
+        <service
+            android:name=".OrgWalkerService"
+            android:label="fuck lark 组织巡游"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+    </application>
+</manifest>
