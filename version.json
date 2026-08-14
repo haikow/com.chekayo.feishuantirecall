@@ -1,7 +1,7 @@
 {
   "versionCode": 16,
   "versionName": "1.6.8",
-  "changelog": "• 新增「去除聊天水印」：外部联系人聊天里平铺你名字/手机尾号的防泄密水印，客户端不画（纯本地、不影响对方）。\n• 退群/移除记录：修复 re-sync、改管理员被误记成退群的假记录。",
+  "changelog": "- **新增「去除聊天水印」**：与外部联系人聊天时，飞书会平铺你自己的名字 / 手机尾号做防泄密水印；本功能在客户端直接不画它（纯本地渲染、不影响对方、不改数据）。一处 hook 覆盖聊天页 / 弹窗 / 文件预览覆盖层，抗混淆跨版本稳。设置面板「🚫 去除聊天水印」开关，默认关，开后重进聊天生效。\n- 修复：模块内部版本号未同步（面板/检查更新显示旧版本）。",
   "downloads": [
     "https://github.com/haikow/com.chekayo.feishuantirecall/releases/latest",
     "https://t.me/fucklark"
