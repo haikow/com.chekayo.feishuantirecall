@@ -1,0 +1,7 @@
+[Unit]
+Description=飞书 asar 自动重打补丁(防撤回/防已读)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/feishu-patch/autopatch.sh

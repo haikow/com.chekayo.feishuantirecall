@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <array name="xposedscope">
+        <item>com.ss.android.lark</item>
+        <item>com.larksuite.suite</item>
+    </array>
+</resources>

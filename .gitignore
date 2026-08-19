@@ -1,0 +1,34 @@
+# 构建产物
+build/
+*.apk
+*.apk.idsig
+
+# 签名私钥 —— 绝不入库（build.sh 会在缺失时自动生成本地 debug.keystore）
+*.keystore
+*.jks
+
+# 逆向分析的目标二进制 / APK（版权 + 可能含账号数据）
+*_base.apk
+*.so
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# 抓取到的真实数据（花名册 / 个人资料 / 聊天导出）—— 绝不入库
+roster*.json
+*_roster*.json
+profiles*.json
+*_export*.json
+
+# 运行期日志与缓存
+*.log
+__pycache__/
+*.pyc
+
+# 编辑器 / 工具
+.claude/
+.idea/
+.vscode/

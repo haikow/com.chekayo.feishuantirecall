@@ -1,0 +1,9 @@
+[Unit]
+Description=监听飞书 asar 变化
+
+[Path]
+PathModified=/opt/bytedance/feishu/webcontent/messenger-next.asar
+Unit=feishu-autopatch.service
+
+[Install]
+WantedBy=multi-user.target
