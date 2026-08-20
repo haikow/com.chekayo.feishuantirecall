@@ -1,7 +1,7 @@
 {
-  "versionCode": 19,
-  "versionName": "1.7.1",
-  "changelog": "- 修复若干已知问题，优化稳定性与兼容性。",
+  "versionCode": 20,
+  "versionName": "1.7.2",
+  "changelog": "- 修复若干已知问题，优化稳定性与兼容性（含部分定制/白标版本设置项无法保存的问题）。",
   "downloads": [
     "https://github.com/haikow/com.chekayo.feishuantirecall/releases/latest",
     "https://t.me/fucklark"
