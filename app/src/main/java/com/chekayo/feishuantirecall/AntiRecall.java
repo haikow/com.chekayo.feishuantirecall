@@ -38,7 +38,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     static boolean isLarkFamily(String pkg) {
         return PKG_FEISHU.equals(pkg) || PKG_LARK.equals(pkg);
     }
-    // 适配飞书二次开发/私有化版(车企等白标: 应用包名换, 但内核类保留 com.bytedance.lark.*):
+    // 适配飞书二次开发/私有化版(白标 app: 应用包名换, 但内核类保留 com.bytedance.lark.*):
     // 探测飞书标志类, 不限包名。LSPosed 勾选目标 app 作用域后, 模块在该进程探测命中即注入。
     // 缓存 g_lark_mark 避免每 hook 重复 loadClass。
     static volatile Integer g_lark_mark;   // null=未测, 1=飞书系, 0=否
@@ -54,8 +54,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.6.9";
-    static final int MODULE_VERSION_CODE = 17;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
+    static final String MODULE_VERSION = "1.7.2";
+    static final int MODULE_VERSION_CODE = 20;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
     static final String MAPPER = "ax2.b";
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
@@ -123,8 +123,16 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         // ---- 0.6) 解除文件/图片下载限制: 加密聊天禁另存 -> 强制放行(按签名定位, 抗混淆) ----
         try { FileDownloadUnlock.install(lpparam.classLoader); } catch (Throwable t) { XposedBridge.log("[fucklark] download unlock init failed: " + t); }
 
+        // ---- 0.65) 解除「保密模式」复制/转发限制: RestrictedMode 门禁拦截器 -> 全放行(按签名定位, 抗混淆) ----
+        try { RestrictedModeUnlock.install(lpparam.classLoader); } catch (Throwable t) { XposedBridge.log("[fucklark] restricted-mode unlock init failed: " + t); }
+
         // ---- 0.7) 主页顶部更新横幅: hook MainActivity.onResume, 有新版时注入横幅 ----
         try { UpdateBanner.install(lpparam.classLoader); } catch (Throwable t) { XposedBridge.log("[fucklark] update banner init failed: " + t); }
+
+        // ---- 0.8) 下载文件另存到系统「下载」: 主进程监听 Lark/download, 写完即 MediaStore 复制到公共 Download ----
+        try {
+            if (PKG.equals(currentProcessName())) installDownloadMirror();
+        } catch (Throwable t) { XposedBridge.log("[fucklark] download mirror init failed: " + t); }
 
         // ---- 1) 原生 SQL 层: 仅主进程 ----
         try {
@@ -207,8 +215,35 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         } catch (Throwable t) { return "?"; }
     }
 
+    /** 下载另存监听: 取 Application context 装 DownloadMirror; context 尚未就绪则 hook Instrumentation.callApplicationOnCreate 兜底。 */
+    static void installDownloadMirror() {
+        try {
+            Object app = XposedHelpers.callStaticMethod(Class.forName("android.app.AndroidAppHelper"), "currentApplication");
+            if (app instanceof android.content.Context) {
+                DownloadMirror.install((android.content.Context) app);
+                return;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            XposedHelpers.findAndHookMethod(android.app.Instrumentation.class, "callApplicationOnCreate",
+                    android.app.Application.class, new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    if (p.args[0] instanceof android.content.Context) DownloadMirror.install((android.content.Context) p.args[0]);
+                }
+            });
+        } catch (Throwable t) { XposedBridge.log("[fucklark][dl] defer install failed: " + t); }
+    }
+
     /** 当前目标飞书包的 files 目录(国内/国际版 + /data/user/0 兼容)。 */
     static File larkFilesDir() {
+        // 首选: App 真实 files 目录(getFilesDir), 任何包名/沙箱/工作资料/虚拟化都对; currentApplication 早期可能为 null -> 回退猜路径。
+        try {
+            Object app = XposedHelpers.callStaticMethod(Class.forName("android.app.AndroidAppHelper"), "currentApplication");
+            if (app instanceof android.content.Context) {
+                File f = ((android.content.Context) app).getFilesDir();
+                if (f != null) return f;
+            }
+        } catch (Throwable ignored) {}
         File dataDir = null;
         for (String d : new String[]{"/data/data/" + PKG, "/data/user/0/" + PKG}) {
             File f = new File(d);

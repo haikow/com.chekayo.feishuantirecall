@@ -21,6 +21,12 @@ public class Config {
     public static volatile boolean notifarchive = false; // 后台消息存档 (hook 通知抓正文, 救后台被撤回的消息)
     public static volatile boolean dewatermark = false; // 去除聊天水印 (hook View.setForeground 丢弃 watermark 前景)
     public static volatile boolean downloadunlock = false; // 解除文件/图片下载限制 (加密聊天禁另存 -> 强制放行)
+    public static volatile boolean restrictunlock = false; // 解除保密模式复制/转发限制 (RestrictedMode 门禁拦截器 -> 全放行)
+    public static volatile boolean pubdownload = false;    // 下载的文件同时另存到系统「下载」(MediaStore, 符合安卓规范)
+    public static volatile boolean screenshotnoaudit = false; // 截图不上报 (no-op 截图审计检测器 ActivityObserver.onActivityResumed)
+    public static volatile boolean forcescreenshot = false;   // 强制截图 (剥离 FLAG_SECURE / SurfaceView.setSecure, 仅飞书进程内)
+    public static volatile boolean noauditall = false;        // 全审计无痕总闸 (no-op AuditEventStorage.writeData(Event), 一处掐全部上报)
+    public static volatile String pubdownloadSubdir = "Lark";  // 公共下载子目录名 (空=直接 Download/; 默认 Download/Lark)
     public static volatile boolean updatebanner = true;  // 主页顶部更新横幅(有新版时提示)
     public static volatile int dismissedUpc = 0;         // 已忽略的更新 versionCode(× 关闭后记住, 不再唠叨)
 
@@ -49,6 +55,12 @@ public class Config {
                 notifarchive = o.optBoolean("notifarchive", false);
                 dewatermark = o.optBoolean("dewatermark", false);
                 downloadunlock = o.optBoolean("downloadunlock", false);
+                restrictunlock = o.optBoolean("restrictunlock", false);
+                pubdownload = o.optBoolean("pubdownload", false);
+                screenshotnoaudit = o.optBoolean("screenshotnoaudit", false);
+                forcescreenshot = o.optBoolean("forcescreenshot", false);
+                noauditall = o.optBoolean("noauditall", false);
+                pubdownloadSubdir = o.optString("pubdownloadSubdir", "Lark");
                 updatebanner = o.optBoolean("updatebanner", true);
                 dismissedUpc = o.optInt("dismissedUpc", 0);
             } else {
@@ -68,11 +80,32 @@ public class Config {
         else if ("notifarchive".equals(key)) notifarchive = v;
         else if ("dewatermark".equals(key)) dewatermark = v;
         else if ("downloadunlock".equals(key)) downloadunlock = v;
+        else if ("restrictunlock".equals(key)) restrictunlock = v;
+        else if ("pubdownload".equals(key)) pubdownload = v;
+        else if ("screenshotnoaudit".equals(key)) screenshotnoaudit = v;
+        else if ("forcescreenshot".equals(key)) forcescreenshot = v;
+        else if ("noauditall".equals(key)) noauditall = v;
         else if ("updatebanner".equals(key)) updatebanner = v;
         save();
     }
 
     public static synchronized void setDismissed(int vc) { dismissedUpc = vc; save(); }
+
+    // 字符串配置(目前仅 pubdownloadSubdir)。子目录名做基本清洗: 去首尾空白与斜杠, 拦非法字符。
+    public static synchronized void setStr(String key, String v) {
+        if ("pubdownloadSubdir".equals(key)) pubdownloadSubdir = sanitizeSubdir(v);
+        save();
+    }
+
+    static String sanitizeSubdir(String s) {
+        if (s == null) return "";
+        s = s.trim();
+        // 去掉首尾斜杠, 过滤路径穿越与非法文件名字符
+        while (s.startsWith("/")) s = s.substring(1);
+        while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+        s = s.replace("..", "").replaceAll("[\\\\:*?\"<>|]", "");
+        return s.trim();
+    }
 
     static synchronized void save() {
         try {
@@ -88,10 +121,21 @@ public class Config {
             o.put("notifarchive", notifarchive);
             o.put("dewatermark", dewatermark);
             o.put("downloadunlock", downloadunlock);
+            o.put("restrictunlock", restrictunlock);
+            o.put("pubdownload", pubdownload);
+            o.put("screenshotnoaudit", screenshotnoaudit);
+            o.put("forcescreenshot", forcescreenshot);
+            o.put("noauditall", noauditall);
+            o.put("pubdownloadSubdir", pubdownloadSubdir);
             o.put("updatebanner", updatebanner);
             o.put("dismissedUpc", dismissedUpc);
+            File dir = cfgFile.getParentFile();
+            if (dir != null && !dir.isDirectory()) dir.mkdirs();   // 定制飞书 files 目录可能尚未创建
             write(cfgFile, o.toString());
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            // 不再静默: 定制/白标飞书写盘失败时(路径/权限/沙箱), 打日志便于用户反馈定位「重启掉配置」。
+            try { de.robv.android.xposed.XposedBridge.log("[fucklark] Config.save 失败 path=" + cfgFile + " err=" + t); } catch (Throwable ignored) {}
+        }
     }
 
     static String read(File f) throws Exception {

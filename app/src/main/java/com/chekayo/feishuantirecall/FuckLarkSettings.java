@@ -140,6 +140,8 @@ public class FuckLarkSettings implements IXposedHookLoadPackage {
     }
 
     static void showPanel(final Context ctx) {
+        // 定制/白标飞书包名与数据目录可能非标准, 猜路径会写失败 -> 用面板自己的 Context 真实 files 目录, 保证读写同一处。
+        try { Config.setFilesDir(ctx.getFilesDir()); } catch (Throwable ignored) {}
         Config.load();
         LinearLayout box = new LinearLayout(ctx);
         box.setOrientation(LinearLayout.VERTICAL);
@@ -173,9 +175,9 @@ public class FuckLarkSettings implements IXposedHookLoadPackage {
                 "去掉外部联系人聊天里平铺你名字/手机尾号的防泄密水印（纯本地渲染，不影响对方）。改开关后重进聊天生效。", Config.dewatermark, new OnToggle() {
             public void on(boolean b) { Config.set("dewatermark", b); }
         }));
-        box.addView(switchRow(ctx, "🔓 解除下载限制",
-                "加密聊天（外部/密聊）禁止另存文件/图片，本功能强制放行（纯本地，不影响对方）。默认关。", Config.downloadunlock, new OnToggle() {
-            public void on(boolean b) { Config.set("downloadunlock", b); }
+        box.addView(actionRow(ctx, "🔓 解除限制（下载 / 保密模式）›",
+                "解除下载限制、下载另存到系统「下载」并自定义目录、解除保密模式复制转发。点开设置。", 0xFF34C759, new View.OnClickListener() {
+            @Override public void onClick(View v) { showUnlockPanel(ctx); }
         }));
         box.addView(switchRow(ctx, "🔔 主页更新提示",
                 "有新版时在飞书消息页顶部显示更新横幅（点击去更新，✕ 忽略该版本）。默认开。", Config.updatebanner, new OnToggle() {
@@ -382,6 +384,100 @@ public class FuckLarkSettings implements IXposedHookLoadPackage {
                 .setPositiveButton("返回", null)
                 .show();
     }
+
+    // ── 二级窗口: 解除限制(下载/保密模式) ── 把三个「解除…」开关+目录设置从主面板隔离出来。
+    static void showUnlockPanel(final Context ctx) {
+        LinearLayout box = new LinearLayout(ctx);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int p = dp(ctx, 20);
+        box.setPadding(p, p, p, p);
+
+        // ── 组① 解除限制（让你能做被禁的操作）──
+        box.addView(groupHeader(ctx, "🔓 解除限制"));
+        box.addView(switchRow(ctx, "🔓 解除下载限制",
+                "加密聊天（外部/密聊）禁止另存文件/图片，本功能强制放行（纯本地，不影响对方）。默认关。", Config.downloadunlock, new OnToggle() {
+            public void on(boolean b) { Config.set("downloadunlock", b); }
+        }));
+        box.addView(switchRow(ctx, "🔓 解除保密模式限制（复制/转发）",
+                "「保密模式」群聊里复制/转发被置灰、点了弹「保密模式已开启」，本功能恢复复制转发（纯本地 UI 门禁，不影响对方）。改开关后重进聊天生效。默认关。", Config.restrictunlock, new OnToggle() {
+            public void on(boolean b) { Config.set("restrictunlock", b); }
+        }));
+        box.addView(switchRow(ctx, "📷 强制截图（去防截图）",
+                "保密聊天里系统截图变黑/被拦，本功能在飞书进程内剥离 FLAG_SECURE 让你能截（只影响飞书，不动系统）。默认关。", Config.forcescreenshot, new OnToggle() {
+            public void on(boolean b) { Config.set("forcescreenshot", b); }
+        }));
+        // 缩进子项: 强制截图的兜底链接
+        View dfsRow = actionRow(ctx, "🔗 个别界面仍截不了？可选装 DisableFlagSecure",
+                "自带「强制截图」覆盖飞书绝大多数防截图；极个别硬件级 secure 画面需系统级模块。点此打开 DisableFlagSecure 项目页。", 0xFF8E8E93, new View.OnClickListener() {
+            @Override public void onClick(View v) { openUrl(ctx, "https://github.com/LSPosed/DisableFlagSecure"); }
+        });
+        indentSubRow(ctx, dfsRow);
+        box.addView(dfsRow);
+
+        // ── 组② 审计无痕（不上报）──
+        box.addView(groupHeader(ctx, "🕶 审计无痕"));
+        box.addView(switchRow(ctx, "🕶 全部操作不上报审计",
+                "总闸：掐掉审计事件入库，复制/下载/预览/存图/存视频/截图/录屏/复制号码/拨号/OCR/打开链接/小程序等所有操作都不再上报企业审计后台（一处覆盖全部，纯本地）。默认关。", Config.noauditall, new OnToggle() {
+            public void on(boolean b) { Config.set("noauditall", b); }
+        }));
+        // 缩进子项: 截图更彻底(连检测都不做)
+        View ssRow = switchRow(ctx, "📷 更彻底：连截图动作都不让飞书检测到",
+                "总闸已让截图不上报；本项更进一步，让截图检测器不启动，飞书连你截了图都无从知晓。改开关后重启飞书生效。默认关。", Config.screenshotnoaudit, new OnToggle() {
+            public void on(boolean b) { Config.set("screenshotnoaudit", b); }
+        });
+        indentSubRow(ctx, ssRow);
+        box.addView(ssRow);
+
+        // ── 组③ 下载另存 ──
+        box.addView(groupHeader(ctx, "📥 下载另存"));
+        box.addView(switchRow(ctx, "📥 下载另存到系统「下载」",
+                "飞书下载的文件只进应用私有目录（文件管理器看不到、卸载即丢）。开启后自动复制一份到公共 Download，符合安卓规范、随处可打开。默认关。", Config.pubdownload, new OnToggle() {
+            public void on(boolean b) { Config.set("pubdownload", b); }
+        }));
+        // 子目录设置(缩进): 常驻显示, 归属于「下载另存」。
+        final View subRow = actionRow(ctx, subdirRowLabel(),
+                "公共下载目录下的子文件夹名（留空=直接存到 Download 根目录）。默认 Lark。", 0xFF3B9EFF, null);
+        subRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                final EditText et = new EditText(ctx);
+                et.setHint("留空=Download 根目录；如：Lark");
+                et.setText(Config.pubdownloadSubdir);
+                int pad = dp(ctx, 16);
+                et.setPadding(pad, pad, pad, pad);
+                new AlertDialog.Builder(ctx)
+                        .setTitle("保存子目录名")
+                        .setView(et)
+                        .setPositiveButton("确定", new android.content.DialogInterface.OnClickListener() {
+                            @Override public void onClick(android.content.DialogInterface d, int w) {
+                                Config.setStr("pubdownloadSubdir", et.getText().toString());
+                                android.widget.Toast.makeText(ctx, "已设为 " + subdirDisplay(), android.widget.Toast.LENGTH_SHORT).show();
+                                if (subRow instanceof LinearLayout && ((LinearLayout) subRow).getChildCount() > 0) {
+                                    View t0 = ((LinearLayout) subRow).getChildAt(0);
+                                    if (t0 instanceof TextView) ((TextView) t0).setText(subdirRowLabel() + "   ›");
+                                }
+                            }
+                        })
+                        .setNegativeButton("取消", null)
+                        .show();
+            }
+        });
+        indentSubRow(ctx, subRow);
+        box.addView(subRow);
+
+        ScrollView sv = new ScrollView(ctx);
+        sv.addView(box);
+        new AlertDialog.Builder(ctx)
+                .setTitle("🔓 解除限制")
+                .setView(sv)
+                .setPositiveButton("返回", null)
+                .show();
+    }
+
+    static String subdirDisplay() {
+        String s = Config.pubdownloadSubdir;
+        return (s == null || s.isEmpty()) ? "Download/（根目录）" : "Download/" + s;
+    }
+    static String subdirRowLabel() { return "📁 保存子目录：" + subdirDisplay(); }
 
     // 二级窗口里的动作行: 标题 + 右侧 › 指示
     static View actionRow(Context ctx, String text, int color, View.OnClickListener cl) {
@@ -774,7 +870,7 @@ public class FuckLarkSettings implements IXposedHookLoadPackage {
             if (p.length < 3) continue;
             String time = p[0], name = p[1], text = p[2];
             share.append(name).append(" (").append(time).append("): ").append(text).append("\n");
-            // 系统消息: 小灰字居中(native 已拼成"cheky 邀请了 张三")
+            // 系统消息: 小灰字居中(native 已拼成"cheky 邀请了 林觉圣")
             if ("系统".equals(name)) {
                 String st = text.replace("{from_user}", "某人").replace("{to_chatters}", "某成员");
                 if (st.length() > 80) st = st.substring(0, 80);

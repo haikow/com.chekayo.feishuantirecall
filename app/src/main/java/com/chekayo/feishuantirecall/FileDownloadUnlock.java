@@ -62,6 +62,112 @@ public class FileDownloadUnlock {
         } catch (Throwable t) {
             XposedBridge.log("[fucklark] download unlock(DownloadCheckUtil) install failed: " + t);
         }
+
+        // ③ 屏蔽下载/预览/存云盘/存图审计 -> 下载无痕(跟随 Config.downloadunlock)。
+        installDownloadAuditSuppress(cl);
+    }
+
+    static final java.util.Set<String> auditImplHooked =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+
+    /**
+     * 屏蔽文件/图片操作审计 —— 打开/预览/下载/存云盘会调 IAuditDependency 的 (String,String,String,String)->void 上报
+     * (报 会话+文件名+mime+key 到企业审计后台); 存图走 auditImageDownload。全部空转 = 下载无痕。授权校验(带 Context/回调
+     * 的方法)不碰, 否则会拦下载。仅 7.70 定位: 类名 FileDetailModuleDependency/PhotoPickerModuleDependencyImpl 未混淆,
+     * 审计实现类在运行时发现(hook getAuditDependency 拿返回对象的类), 只按 4×String 签名空转。
+     */
+    static void installDownloadAuditSuppress(ClassLoader cl) {
+        // 文件: hook FileDetailModuleDependency.getAuditDependency() -> 发现实现类 -> 空转其 (String×4)->void 方法
+        try {
+            Class<?> dep = cl.loadClass("com.ss.android.lark.filedetail.FileDetailModuleDependency");
+            XposedBridge.hookAllMethods(dep, "getAuditDependency", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    Object impl = p.getResult();
+                    if (impl == null) return;
+                    Class<?> c = impl.getClass();
+                    if (!auditImplHooked.add(c.getName())) return;   // 每个实现类只挂一次
+                    int n = 0;
+                    for (Method m : c.getDeclaredMethods()) {
+                        if (m.isSynthetic() || m.isBridge()) continue;
+                        if (m.getReturnType() != void.class) continue;
+                        Class<?>[] ps = m.getParameterTypes();
+                        if (ps.length != 4) continue;
+                        if (ps[0] != String.class || ps[1] != String.class || ps[2] != String.class || ps[3] != String.class) continue;
+                        final String mn = m.getName();
+                        XposedBridge.hookMethod(m, new XC_MethodHook() {
+                            @Override protected void beforeHookedMethod(MethodHookParam q) {
+                                if (Config.downloadunlock) {
+                                    q.setResult(null);   // 跳过审计上报
+                                    if (Config.diaglog) XposedBridge.log("[fucklark] 已拦下文件审计上报: " + mn
+                                            + "(" + java.util.Arrays.toString(q.args) + ")");
+                                }
+                            }
+                        });
+                        n++;
+                    }
+                    XposedBridge.log("[fucklark] 屏蔽下载审计: " + c.getName() + " 空转 " + n + " 个上报方法");
+                }
+            });
+            XposedBridge.log("[fucklark] 屏蔽下载审计: 已挂 FileDetailModuleDependency.getAuditDependency (进程 " + AntiRecall.currentProcessName() + ")");
+        } catch (Throwable t) {
+            XposedBridge.log("[fucklark] download-audit suppress(file) install failed: " + t);
+        }
+        // 图片: hook PhotoPickerModuleDependencyImpl.auditImageDownload(String) -> 空转
+        try {
+            Class<?> ppd = cl.loadClass("com.ss.android.lark.framework.assembly.photopicker.PhotoPickerModuleDependencyImpl");
+            int n = XposedBridge.hookAllMethods(ppd, "auditImageDownload", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (Config.downloadunlock) {
+                        p.setResult(null);
+                        if (Config.diaglog) XposedBridge.log("[fucklark] 已拦下图片审计上报: auditImageDownload("
+                                + java.util.Arrays.toString(p.args) + ")");
+                    }
+                }
+            }).size();
+            XposedBridge.log("[fucklark] 屏蔽下载审计: PhotoPickerModuleDependencyImpl.auditImageDownload 已 hook " + n + " 个");
+        } catch (Throwable t) {
+            XposedBridge.log("[fucklark] download-audit suppress(image) install failed: " + t);
+        }
+        // 总出口(双保险): 存图/存视频的所有路径(PhotoPicker / ChatAuditDependency 等)最终都汇到审计服务
+        // y33.a.a().auditImageDownload / auditMediaDownload。hook 访问器 y33.a.a() 发现服务实例, 按未混淆名空转其
+        // auditImageDownload / auditMediaDownload -> 一网打尽。仅 7.70 定位(y33.a 混淆名; 方法名未混淆)。
+        try {
+            Class<?> y33a = cl.loadClass("y33.a");
+            XposedBridge.hookAllMethods(y33a, "a", new XC_MethodHook() {
+                @Override protected void afterHookedMethod(MethodHookParam p) {
+                    Object svc = p.getResult();
+                    if (svc == null) return;
+                    Class<?> c = svc.getClass();
+                    if (!auditImplHooked.add("svc:" + c.getName())) return;   // 服务实现类只挂一次
+                    int n = hookNamedVoidMethods(c, "auditImageDownload") + hookNamedVoidMethods(c, "auditMediaDownload");
+                    XposedBridge.log("[fucklark] 屏蔽下载审计(总出口): " + c.getName() + " 空转 " + n + " 个存图/存视频上报");
+                }
+            });
+            XposedBridge.log("[fucklark] 屏蔽下载审计: 已挂审计服务访问器 y33.a.a (进程 " + AntiRecall.currentProcessName() + ")");
+        } catch (Throwable t) {
+            XposedBridge.log("[fucklark] download-audit suppress(sink) install failed: " + t);
+        }
+    }
+
+    // 空转某类中所有指定名字的方法(存图/存视频审计), 返回挂上的数量。
+    static int hookNamedVoidMethods(Class<?> c, final String name) {
+        int n = 0;
+        for (Method m : c.getDeclaredMethods()) {
+            if (m.isSynthetic() || m.isBridge()) continue;
+            if (!m.getName().equals(name)) continue;
+            final String mn = m.getName();
+            XposedBridge.hookMethod(m, new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (Config.downloadunlock) {
+                        p.setResult(null);
+                        if (Config.diaglog) XposedBridge.log("[fucklark] 已拦下存图/存视频审计上报: " + mn
+                                + "(" + java.util.Arrays.toString(p.args) + ")");
+                    }
+                }
+            });
+            n++;
+        }
+        return n;
     }
 
     // FileOpenUtils 里唯一的 static、无参、返回 boolean 的方法(不唯一则返回 null, 宁可不 hook 也不 hook 错)

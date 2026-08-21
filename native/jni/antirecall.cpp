@@ -502,7 +502,7 @@ static long long find_id_after(const char *text, const char *key) {
     }
     return 0;
 }
-// 把系统消息(邀请/移除/改群名)拼成清晰中文: "cheky 邀请了 张三"。
+// 把系统消息(邀请/移除/改群名)拼成清晰中文: "cheky 邀请了 林觉圣"。
 static void build_system_line(const char *text, void *db, char *out, int outsz) {
     long long fid = find_id_after(text, "from_user ");
     long long tid = find_id_after(text, "to_chatters ");
@@ -553,7 +553,7 @@ static void do_export(void *db) {
         char nm[64]; get_chatter_name(db, from, nm, sizeof nm);
         for (int k = 0; nm[k]; k++) if (nm[k] == '\t') nm[k] = ' ';
         char tstr[24]; time_t tt = (time_t) ct; struct tm tmv; localtime_r(&tt, &tmv); strftime(tstr, sizeof tstr, "%m-%d %H:%M", &tmv);
-        if (from == 1 && tx[0]) {   // 系统消息: 拼成"cheky 邀请了 张三"
+        if (from == 1 && tx[0]) {   // 系统消息: 拼成"cheky 邀请了 林觉圣"
             char sysl[256]; build_system_line(tx, db, sysl, sizeof sysl);
             for (int k = 0; sysl[k]; k++) if (sysl[k] == '\t' || sysl[k] == '\n') sysl[k] = ' ';
             fprintf(f, "%s\t系统\t%s\n", tstr, sysl);
@@ -803,7 +803,7 @@ static int my_step(void *stmt) {
         }
         // 注意: 导出【不再】在此处靠 strstr(t,"messages") 松触发 —— 那会命中任何含 messages 的语句
         //   (SELECT/UPDATE me_read/REPLACE 新消息...), 导致"别人退群整表刷新成员"被误判成被踢、
-        //   把你还在的群整群导出, 还产出一堆空的"未取到群名"文件。
+        //   把你还在的群整群导出(实测会把某个正常群名误当被踢), 还产出一堆空的"未取到群名"文件。
         //   真被踢的唯一可靠信号 = 紧接着【真的删这个群的消息】(DELETE FROM messages)。故把导出
         //   下移到下面"窗口内拦删消息"处: 只有真要删消息时才 do_export(此刻消息还在, 读得到完整数据)。
         if (strncmp(t, "DELETE", 6) == 0) {
