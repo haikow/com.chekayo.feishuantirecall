@@ -158,6 +158,12 @@ final class SettingsPanel {
             @Override public void on(boolean b) { Config.set("notifarchive", b); }
         }));
         c1.addView(Ui.dividerRow(ctx));
+        c1.addView(Ui.switchRow(ctx, "屏蔽消息速览",
+                "隐藏会话里 AI 总结的「消息速览」浮层（整条含边框）。",
+                Config.blockaipeek, new Ui.OnToggle() {
+            @Override public void on(boolean b) { Config.set("blockaipeek", b); }
+        }));
+        c1.addView(Ui.dividerRow(ctx));
         c1.addView(Ui.switchRow(ctx, "移除聊天水印", "去掉外部联系人聊天里的平铺水印，改后重进聊天生效",
                 Config.dewatermark, new Ui.OnToggle() {
             @Override public void on(boolean b) { Config.set("dewatermark", b); }

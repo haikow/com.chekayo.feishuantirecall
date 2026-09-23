@@ -54,8 +54,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.8.2";
-    static final int MODULE_VERSION_CODE = 24;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
+    static final String MODULE_VERSION = "1.8.3";
+    static final int MODULE_VERSION_CODE = 25;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
     static final String MAPPER = "ax2.b";
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
@@ -186,6 +186,9 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
 
         // ---- 0.5) 去除聊天水印: hook View.setForeground, 丢弃水印包的前景 drawable ----
         try { installWatermarkHook(); } catch (Throwable t) { XposedBridge.log("[fucklark] watermark init failed: " + t); }
+
+        // ---- 0.55) 屏蔽输入框上方「消息速览」AI 总结小提示 ----
+        try { AiPeekBlock.install(); } catch (Throwable t) { XposedBridge.log("[fucklark] ai peek init failed: " + t); }
 
         // ---- 0.6) 解除文件/图片下载限制: 加密聊天禁另存 -> 强制放行(按签名定位, 抗混淆) ----
         try { FileDownloadUnlock.install(lpparam.classLoader); } catch (Throwable t) { XposedBridge.log("[fucklark] download unlock init failed: " + t); }

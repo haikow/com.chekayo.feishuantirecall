@@ -47,6 +47,7 @@ public class Config {
     public static volatile String pubdownloadSubdir = "Lark";  // 公共下载子目录名 (空=直接 Download/; 默认 Download/Lark)
     public static volatile boolean updatebanner = true;  // 主页顶部更新横幅(有新版时提示)
     public static volatile int dismissedUpc = 0;         // 已忽略的更新 versionCode(× 关闭后记住, 不再唠叨)
+    public static volatile boolean blockaipeek = true;   // 屏蔽 AI 总结「消息速览」浮层（整条）
     // ── 防撤回展示选项 ──
     public static volatile boolean showRecallHint = true;      // 是否展示「xxx撤回了一条消息」提示
     public static volatile boolean recallHintOriginal = true;  // 撤回提示是否附带原文
@@ -104,6 +105,7 @@ public class Config {
             o.put("showRecallHint", showRecallHint);
             o.put("recallHintOriginal", recallHintOriginal);
             o.put("recallHintText", recallHintText);
+            o.put("blockaipeek", blockaipeek);
             return o.toString();
         } catch (Throwable t) { return "{}"; }
     }
@@ -130,6 +132,7 @@ public class Config {
             showRecallHint = o.optBoolean("showRecallHint", true);
             recallHintOriginal = o.optBoolean("recallHintOriginal", true);
             recallHintText = o.optString("recallHintText", "撤回了一条消息");
+            blockaipeek = o.optBoolean("blockaipeek", true);
             save();
             return true;
         } catch (Throwable t) { return false; }
@@ -177,6 +180,7 @@ public class Config {
                 showRecallHint = o.optBoolean("showRecallHint", true);
                 recallHintOriginal = o.optBoolean("recallHintOriginal", true);
                 recallHintText = o.optString("recallHintText", "撤回了一条消息");
+                blockaipeek = o.optBoolean("blockaipeek", true);
             } else {
                 // 首次无本地文件：不立刻 save（多进程会互相覆盖成默认值）。由 sync 对齐后再落盘。
             }
@@ -204,6 +208,7 @@ public class Config {
         else if ("updatebanner".equals(key)) { changed = updatebanner != v; updatebanner = v; }
         else if ("showRecallHint".equals(key)) { changed = showRecallHint != v; showRecallHint = v; }
         else if ("recallHintOriginal".equals(key)) { changed = recallHintOriginal != v; recallHintOriginal = v; }
+        else if ("blockaipeek".equals(key)) { changed = blockaipeek != v; blockaipeek = v; }
         if (!changed) return;
         updatedAt = System.currentTimeMillis();
         save();
@@ -356,6 +361,7 @@ public class Config {
             o.put("showRecallHint", showRecallHint);
             o.put("recallHintOriginal", recallHintOriginal);
             o.put("recallHintText", recallHintText);
+            o.put("blockaipeek", blockaipeek);
             File dir = cfgFile.getParentFile();
             if (dir != null && !dir.isDirectory()) dir.mkdirs();   // 定制飞书 files 目录可能尚未创建
             write(cfgFile, o.toString());
