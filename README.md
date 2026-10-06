@@ -80,6 +80,22 @@ build.sh / build.ps1    一键构建（Linux / Windows）
 - `防已读-逆向结论-v7.69.6.md` / `防已读-复盘-从native碰墙到Java破局.md`
 - [CONTRIBUTING.md](CONTRIBUTING.md) —— 怎么给新版本重新定位偏移并提 PR
 
+## 双版本发布（legacy / api102）
+
+自 v1.8.9 起维护两条线，**功能一致、包名相同、同一签名**（可互相覆盖安装，数据不丢）：
+
+| 线 | 分支 | 适用框架 | versionCode | 更新检查 |
+|---|---|---|---|---|
+| **legacy（主线）** | `main` | 传统 LSPosed / XposedBridge API 82 | 正常递增 | `version.json` |
+| **api102** | `libxposed-api-102-migration` | 仅 libxposed API 102 新框架（LSPosed v2.2+ modern） | = legacy + 1000 | `version-api102.json` |
+
+发布形态：
+
+- **本仓库**：每个版本一个 Release 挂两个包（`feishukit-<版本>-legacy.apk` / `feishukit-<版本>-api102.apk`）+ 选择说明表。
+- **模块市场镜像（Xposed-Modules-Repo）**：保持两个 Release——稳定版单 APK（Latest，市场更新器只认单资产，绝不多包同 Release）+ api102 prerelease。市场永远只向 legacy 用户推 legacy 包。
+- api102 线在旧框架上不会生效；拿不准选哪个就装 legacy。
+- 待 legacy 用户迁移完成（或主流框架仅支持新 API）后，api102 合回 main 转正。
+
 ## 赞助 / Sponsor
 
 飞书更新频繁，跟版本、重新定位偏移、修复 hook 需要持续投入。如果 FeishuKit 帮到了你，欢迎赞助支持我持续维护、适配新版本：
