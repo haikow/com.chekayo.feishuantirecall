@@ -1,0 +1,11 @@
+{
+  "versionCode": 1031,
+  "versionName": "1.8.9-api102",
+  "channel": "https://t.me/fucklark",
+  "changelog": "· 预览版：从 legacy Xposed API 迁移到 libxposed API 102（单模 modern）\n· 仅供支持 libxposed API 102 的新框架（如 LSPosed v2.2+）；老 LSPosed 用户请用 legacy 稳定版\n· 功能与 legacy 版一致，native 层相同；框架交互方式全面替换\n· 感谢 HansYeoh（PR #7）",
+  "downloads": [
+    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1031-1.8.9-api102",
+    "https://t.me/fucklark"
+  ],
+  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1031-1.8.9-api102"
+}
