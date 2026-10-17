@@ -29,8 +29,9 @@ HEAD_SHA=$(echo "$META" | cut -f1); ADD=$(echo "$META" | cut -f2); DEL=$(echo "$
 NFILES=$(echo "$META" | cut -f4); AUTHOR=$(echo "$META" | cut -f5)
 BASE_BRANCH=$(echo "$META" | cut -f6)
 DIFF=$(gh_run pr diff "$PR" -R "$REPO") || { echo "取 diff 失败"; exit 2; }
-FILES_JSON=$(gh_retry --paginate --slurp "repos/$REPO/pulls/$PR/files?per_page=100" \
-  --jq '[.[][]]') || { echo "取文件清单失败"; exit 2; }
+FILE_PAGES=$(gh_retry --paginate --slurp "repos/$REPO/pulls/$PR/files?per_page=100") || { echo "取文件清单失败"; exit 2; }
+FILES_JSON=$(printf '%s\n' "$FILE_PAGES" | python -c 'import json,sys; print(json.dumps([f for page in json.load(sys.stdin) for f in page]))') \
+  || { echo "解析文件清单失败"; exit 2; }
 
 FAIL=0; REPORT="## 🤖 自动审查 · PR #$PR
 
@@ -105,8 +106,9 @@ fi
 
 # ── G7 版本一致性 ────────────────────────────────────────────────
 # Version validation reads patch text as data; it never imports code from the PR.
-RELEASE_TAGS=$(gh_retry --paginate --slurp "repos/$REPO/releases?per_page=100" \
-  --jq '[.[][] | select(.draft == false) | .tag_name]') || { echo "取发布版本失败"; exit 2; }
+RELEASE_PAGES=$(gh_retry --paginate --slurp "repos/$REPO/releases?per_page=100") || { echo "取发布版本失败"; exit 2; }
+RELEASE_TAGS=$(printf '%s\n' "$RELEASE_PAGES" | python -c 'import json,sys; print(json.dumps([r["tag_name"] for page in json.load(sys.stdin) for r in page if not r["draft"]]))') \
+  || { echo "解析发布版本失败"; exit 2; }
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if VERSION_RESULT=$(printf '%s\n' "$FILES_JSON" | python "$SCRIPT_DIR/check_pr_versions.py" \
     --base-branch "$BASE_BRANCH" --release-tags "$RELEASE_TAGS" 2>&1); then
