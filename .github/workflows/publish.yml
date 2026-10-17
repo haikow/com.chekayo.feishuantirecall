@@ -38,6 +38,8 @@ jobs:
     environment: production
     permissions:
       contents: write      # Release/资产/版本文件回写
+      id-token: write      # 构建出处证明(attest)签名
+      attestations: write  # 写入 attestation
     steps:
       - name: 解析 tag 与目标线
         id: meta
@@ -58,6 +60,7 @@ jobs:
         with:
           ref: ${{ steps.meta.outputs.tag }}
           fetch-depth: 0    # 稳定版需同时取迁移分支尖端构建 api102 包
+          persist-credentials: false   # 后续步骤不留 git 凭据, 压缩脚本注入后的凭据窃取面
 
       - name: Materialize api102 version info
         if: steps.meta.outputs.line == 'api102'
@@ -68,6 +71,15 @@ jobs:
 
       - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
         with: { distribution: temurin, java-version: '17' }
+
+      - name: Cache Android SDK components
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            /usr/local/lib/android/sdk/build-tools/34.0.0
+            /usr/local/lib/android/sdk/platforms/android-34
+            /usr/local/lib/android/sdk/ndk/27.2.12479018
+          key: sdk-bt34-plat34-ndk272
 
       - name: Install SDK/NDK
         run: |
@@ -143,6 +155,11 @@ jobs:
           else
             bash scripts/ci/tg_publish.sh "$(ls dist/feishukit-*.apk)" - dist/tg_announce.html
           fi
+
+      - name: Attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: 'dist/*.apk'
 
       - name: Dry-run summary
         if: ${{ inputs.dry_run }}
