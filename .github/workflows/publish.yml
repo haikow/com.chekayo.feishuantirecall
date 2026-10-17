@@ -1,0 +1,150 @@
+# 统一发布 bot: push tag(<vc>-<vn> 或 <vc>-<vn>-api102) → 构建+签名+四渠道发布 全自动
+#
+# ⚠️ 私钥风险声明(2026-10 维护者决策):
+#   本 workflow 使用存于 GitHub Secrets 的签名私钥(KEYSTORE_BASE64)。私钥上云后,
+#   GitHub 账号/PAT/恶意 workflow 任一失守 = 攻击者可签出通过模块防篡改校验(EXPECTED_SIG
+#   钉指纹)的"官方更新"。此 key 无法更换(换了老用户断升级)。缓解措施:
+#     1. secrets 挂 Environment 'production',部署策略仅允许 refs/tags/*(PR 永远拿不到)
+#     2. 触发仅为 tag push(需仓库写权限)与手动手动 workflow_dispatch
+#     3. 不使用 pull_request_target; 第三方 action 全部钉 commit SHA
+#     4. 每 job 显式最小 permissions
+#   回退: 删除 secrets + 删除本 workflow → 恢复本地流水线(仓库 scripts/ 仍保留全流程)。
+#
+# 双线规则:
+#   tag 无 -api102 → 稳定版: 构建 tag(legacy) + 迁移分支尖端(api102), 主仓库双包 Release,
+#                     市场仓库稳定版单包 + version.json 回写; api102 prerelease 不动
+#   tag 含 -api102 → 预览版: 仅构建该 tag(api102), 双仓库 prerelease, 不动稳定版/置顶
+name: publish
+
+on:
+  push:
+    tags: ['*-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag (如 34-1.8.12)'
+        required: true
+      dry_run:
+        description: '演练模式(不真发布)'
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  publish:
+    name: 构建签名并发布
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: write      # Release/资产/版本文件回写
+    steps:
+      - name: 解析 tag 与目标线
+        id: meta
+        run: |
+          TAG="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          case "$TAG" in
+            *-api102) LINE=api102 ;;
+            *)        LINE=legacy ;;
+          esac
+          VC="${TAG%%-*}"; VN="${TAG#*-}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "vc=$VC"     >> "$GITHUB_OUTPUT"
+          echo "vn=$VN"     >> "$GITHUB_OUTPUT"
+          echo "line=$LINE" >> "$GITHUB_OUTPUT"
+          echo "TAG=$TAG VC=$VC VN=$VN LINE=$LINE"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0    # 稳定版需同时取迁移分支尖端构建 api102 包
+
+      - name: Materialize api102 version info
+        if: steps.meta.outputs.line == 'api102'
+        run: |
+          # api102 tag 检出的是迁移分支(其 version.json 为 legacy 内容); 版本与更新说明以 main 的 version-api102.json 为准
+          git show origin/main:version-api102.json > version.json
+          cat version.json | head -4
+
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with: { distribution: temurin, java-version: '17' }
+
+      - name: Install SDK/NDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -1)"
+          echo "sdkmanager = $SDKM"
+          "$SDKM" "build-tools;34.0.0" "platforms;android-34" "ndk;27.2.12479018" >/dev/null
+
+      - name: Decode signing key
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > /tmp/release.keystore
+          chmod 600 /tmp/release.keystore
+          echo "KEYSTORE=/tmp/release.keystore" >> "$GITHUB_ENV"
+
+      - name: Build legacy + api102 packages
+        env:
+          EXPECT_SIG: 0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd
+        run: |
+          # 引导兜底: 老 tag 的树里可能没有 scripts/ci(晚于 tag 创建), 从 main 覆盖拉取最新 CI 脚本
+          git checkout origin/main -- scripts/ci 2>/dev/null || echo "scripts/ci already in tag tree"
+          mkdir -p dist
+          if [ "${{ steps.meta.outputs.line }}" = legacy ]; then
+            bash scripts/ci/build_and_verify.sh "$GITHUB_WORKSPACE" "$EXPECT_SIG" "dist/feishukit-${{ steps.meta.outputs.vn }}-legacy.apk"
+            git worktree add /tmp/wt-api102 origin/libxposed-api-102-migration
+            cp scripts/ci/build_and_verify.sh /tmp/wt-api102/ 2>/dev/null || true
+            API102_VN="$(grep -o 'versionName="[^"]*"' /tmp/wt-api102/app/src/main/AndroidManifest.xml | head -1 | cut -d'"' -f2)"
+            bash /tmp/wt-api102/build_and_verify.sh /tmp/wt-api102 "$EXPECT_SIG" "$GITHUB_WORKSPACE/dist/feishukit-${API102_VN}.apk" || { echo "api102 build failed (preexisting) — 继续仅发 legacy"; }
+          else
+            bash scripts/ci/build_and_verify.sh "$GITHUB_WORKSPACE" "$EXPECT_SIG" "dist/feishukit-${{ steps.meta.outputs.vn }}.apk"
+          fi
+          ls -la dist/
+
+      - name: Generate release notes
+        run: |
+          bash scripts/ci/gen_notes.sh "${{ steps.meta.outputs.tag }}" dist/ > dist/RELEASE_NOTES.md
+          head -30 dist/RELEASE_NOTES.md
+
+      - name: Publish (main repo)
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            -t "${{ steps.meta.outputs.vn }} · $(python3 -c "import json;d=json.load(open('version.json'));print(d['changelog'].split(chr(10))[0].lstrip('· '))")" \
+            -F dist/RELEASE_NOTES.md \
+            ${{ steps.meta.outputs.line == 'api102' && '--prerelease' || '' }} || echo "release exists"
+          for i in 1 2 3 4 5; do gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*.apk && break; sleep $((i*2)); done
+
+      - name: Publish (market repo via PAT)
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.MARKET_PAT }}
+        run: |
+          SUMMARY="$(python3 -c "import json;d=json.load(open('version.json'));print(d['changelog'].split(chr(10))[0].lstrip('· '))")"
+          if [ "${{ steps.meta.outputs.line }}" = legacy ]; then
+            bash scripts/ci/market_sync.sh "${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.vn }}" \
+              dist/feishukit-*-legacy.apk dist/feishukit-*-api102.apk dist/RELEASE_NOTES.md "$SUMMARY"
+          else
+            bash scripts/ci/market_sync.sh "${{ steps.meta.outputs.tag }}" "${{ steps.meta.outputs.vn }}" \
+              - dist/feishukit-*.apk dist/RELEASE_NOTES.md "$SUMMARY"
+          fi
+
+      - name: Publish (Telegram dual-package)
+        if: ${{ !inputs.dry_run }}
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          bash scripts/ci/gen_tg_notes.sh "${{ steps.meta.outputs.tag }}" > dist/tg_announce.html
+          if [ "${{ steps.meta.outputs.line }}" = legacy ]; then
+            L=$(ls dist/feishukit-*-legacy.apk); A=$(ls dist/feishukit-*-api102.apk 2>/dev/null || echo -)
+            bash scripts/ci/tg_publish.sh "$L" "${A:--}" dist/tg_announce.html
+          else
+            bash scripts/ci/tg_publish.sh "$(ls dist/feishukit-*.apk)" - dist/tg_announce.html
+          fi
+
+      - name: Dry-run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "DRY-RUN 完成：构建与验签已执行，发布步骤跳过(dry_run=true)"

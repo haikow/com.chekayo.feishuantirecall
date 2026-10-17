@@ -1,0 +1,59 @@
+# PR 即时检查: 门禁(pr_gate.sh) + 编译验证(临时丢弃型 keystore, 产物不发布)
+# - 无任何 secrets 依赖; GITHUB_TOKEN 仅只读 + PR 评论
+# - 与本地 ZCode 巡检共用"🤖 自动审查"评论格式(headRefOid 去重), 互不重复
+# 安全: 所有第三方 action 钉完整 commit SHA; 绝不使用 pull_request_target
+name: pr-check
+
+on:
+  pull_request:
+    branches: [main, libxposed-api-102-migration]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: pr-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: 门禁检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # 门禁只需要 scripts/ 与 PR diff, 浅克隆足够
+          sparse-checkout: |
+            scripts
+      - name: Run pr_gate (comment to PR)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # ubuntu runner 无 `python` 命令别名, pr_gate.sh 用的是 python; 垫一个指向 python3
+          mkdir -p "$HOME/.local/bin" && ln -sf "$(command -v python3)" "$HOME/.local/bin/python"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          bash scripts/pr_gate.sh "${{ github.event.pull_request.number }}"
+
+  build:
+    name: 编译验证 (unsigned, 不发布)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Install SDK components + NDK
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKM" ] || SDKM="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager | head -1)"
+          "$SDKM" "build-tools;34.0.0" "platforms;android-34" "ndk;27.2.12479018" >/dev/null
+      - name: Build (throwaway keystore, artifact never published)
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        run: |
+          # CI 无私钥: 让 build.sh 自动生成丢弃型 debug keystore, 仅验证可编译可打包
+          ./build.sh
+          test -s feishu-antirecall.apk && echo "BUILD_VERIFY_OK size=$(stat -c%s feishu-antirecall.apk)"
