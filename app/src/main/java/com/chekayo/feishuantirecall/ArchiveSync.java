@@ -18,7 +18,20 @@ public final class ArchiveSync {
     public static final String ACTION_PUSH = "com.chekayo.feishuantirecall.ARCHIVE_PUSH";
     /** 模块 → 飞书：请把档案/离职名单推过来（模块进程活着时才收得到 PUSH）。 */
     public static final String ACTION_PULL = "com.chekayo.feishuantirecall.ARCHIVE_PULL";
+    public static final String ACTION_REFRESH = "com.chekayo.feishuantirecall.ARCHIVE_REFRESH";
     private ArchiveSync() { }
+
+    public static void requestRefresh(Context ctx) {
+        if (ctx == null) return;
+        if (!Config.MODULE_PKG.equals(ctx.getPackageName())) {
+            com.chekayo.larkresign.ResignTracker.requestRefresh("打开离职名单");
+        } else {
+            for (String pkg : new String[]{ "com.ss.android.lark", "com.larksuite.suite" }) {
+                Intent i = new Intent(ACTION_REFRESH); i.setPackage(pkg); ctx.sendBroadcast(i);
+            }
+        }
+        requestPull(ctx);
+    }
 
     /** 模块进程打开记录页时：请求飞书侧推送档案副本（需飞书在运行）。 */
     public static void requestPull(Context ctx) {
@@ -45,6 +58,11 @@ public final class ArchiveSync {
             if (f.length() > 8L * 1024 * 1024) return;
             byte[] data = Config.readBytes(f);
             if (data == null || data.length == 0) return;
+            try {
+                Bundle extras = new Bundle(); extras.putByteArray("data", data);
+                Bundle result = c.getContentResolver().call(ConfigProvider.URI, "putFile", name, extras);
+                if (result != null && result.getBoolean("ok")) return;
+            } catch (Throwable t) { android.util.Log.w("fucklark", "档案 Provider 推送失败，回落广播", t); }
             Intent i = new Intent(ACTION_PUSH);
             i.setPackage("com.chekayo.feishuantirecall");
             i.putExtra("name", name);
@@ -77,7 +95,11 @@ public final class ArchiveSync {
             // v1.8.2+ 按账号隔离: 档案在 accounts/<uid>/resign_tracker/, 存档文本直接在 accounts/<uid>/
             for (String u : uids) {
                 if (u == null || u.isEmpty()) continue;
-                File f = new File("/data/data/" + pkg + "/files/accounts/" + u + "/" + name);
+                File f = new File("/data/data/" + pkg + "/files/accounts/" + u + "/resign_tracker/" + name);
+                if (f.exists()) return f;
+                f = new File("/data/user/0/" + pkg + "/files/accounts/" + u + "/resign_tracker/" + name);
+                if (f.exists()) return f;
+                f = new File("/data/data/" + pkg + "/files/accounts/" + u + "/" + name);
                 if (f.exists()) return f;
                 f = new File("/data/user/0/" + pkg + "/files/accounts/" + u + "/" + name);
                 if (f.exists()) return f;
@@ -110,9 +132,7 @@ public final class ArchiveSync {
                 File out = name.endsWith(".txt")
                         ? new File(context.getFilesDir(), name)
                         : new File(dir, name);
-                FileOutputStream os = new FileOutputStream(out);
-                os.write(data);
-                os.close();
+                Config.write(out, new String(data, "UTF-8"));
                 out.setReadable(true, false);
                 android.util.Log.i("fucklark", "ArchiveSync.recv " + name + " bytes=" + data.length);
             } catch (Throwable t) {

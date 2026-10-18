@@ -21,13 +21,18 @@ import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedInterface;
 
-/** Decorates the existing bubble, without replacing its background or adding a row. */
+/** 在保留的原消息气泡上显示撤回提示或虚线标识；回收时恢复宿主布局。 */
 final class RecallBubbleUi {
+    private static final long POLL_BURST_MS = 2500L;
+    private static final long POLL_INTERVAL_MS = 1000L;
     static final String BLOCK = "com.ss.android.lark.chat.chatwindow.biz.component.messagelist.render.block.MessageGlobalBlock";
     private static final Map<View, Binding> bindings = new WeakHashMap<View, Binding>();
     private static Handler handler;
     private static boolean scheduled;
+    private static long pollUntil;
     private static Method outline;
+    private static volatile String hookStatus = "未安装";
+    static String status() { return hookStatus; }
 
     static Method findOutline(Class<?> layout) throws NoSuchMethodException {
         Method found = null;
@@ -60,6 +65,7 @@ final class RecallBubbleUi {
         if (found == null) throw new NoSuchMethodException("bubble bind");
         return found;
     }
+    /** 找到宿主气泡绑定入口；复用 View 时先清掉旧消息的描边，再绑定新消息。 */
     static void install(ClassLoader cl) throws Throwable {
         outline = findOutline(cl.loadClass("com.larksuite.component.ui.layout.LKUIRoundLinearLayout"));
         Class<?> block = cl.loadClass(BLOCK), holder = cl.loadClass(BLOCK + "$MessageGlobalViewHolder");
@@ -75,14 +81,19 @@ final class RecallBubbleUi {
                 Object result = chain.proceed();
                 try {
                     Object model = chain.getArgs().get(1);
-                    if (view != null && model != null) bind(view, RecallMessages.account(),
-                            RecallMessages.value(model, "getChatId"), RecallMessages.value(model, "getId"));
+                    if (view != null && model != null) {
+                        // 只为真实进入气泡的模型保存 Java 兜底原文，避免全局 hook
+                        // MessageInfo.getMessage 在消息行反复取模型时执行反射。
+                        RecallMessages.prepare(model);
+                        bind(view, RecallMessages.account(),
+                                RecallMessages.value(model, "getChatId"), RecallMessages.value(model, "getId"));
+                    }
                 } catch (Throwable ignored) {}
                 return result;
             }
         });
         HotReloadSafety.markExternalCallback("recall.bubble.attach-layout-refresh");
-        ModuleLog.log("[fucklark] 撤回气泡: " + bind.getDeclaringClass().getName() + "." + bind.getName());
+        Diag.once("[fucklark] 撤回气泡: " + bind.getDeclaringClass().getName() + "." + bind.getName());
     }
     static void unbind(View view) {
         if (view == null) return;
@@ -92,6 +103,7 @@ final class RecallBubbleUi {
         previous.dispose();
         view.removeOnLayoutChangeListener(previous);
     }
+    /** 描边绑定账号、会话和消息 ID，避免切号或列表复用时标错消息。 */
     static void bind(View view, String uid, String chat, String id) {
         unbind(view);
         if (RecallMessages.key(uid, chat, id) == null) return;
@@ -103,44 +115,65 @@ final class RecallBubbleUi {
         schedule();
     }
     static void schedule() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            if (handler == null) handler = new Handler(Looper.getMainLooper());
+            handler.post(new Runnable() { @Override public void run() { schedule(); } });
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now >= pollUntil) pollUntil = now + POLL_BURST_MS;
         if (scheduled) return;
         if (handler == null) handler = new Handler(Looper.getMainLooper());
         scheduled = true;
-        handler.postDelayed(REFRESH, 500);
+        handler.postDelayed(REFRESH, POLL_INTERVAL_MS);
     }
     static final Runnable REFRESH = new Runnable() {
         @Override public void run() {
             scheduled = false;
             String uid = RecallMessages.account();
             boolean active = RecallTranslationUi.refresh(uid);
+            active |= System.currentTimeMillis() < pollUntil;
             for (Map.Entry<View, Binding> item : new ArrayList<Map.Entry<View, Binding>>(bindings.entrySet())) {
                 View view = item.getKey();
                 if (!RecallVisibility.visible(view)) continue;
-                active |= Config.antirecall && Config.showRecallHint && AntiRecall.TAMPER != 2;
                 item.getValue().refresh(view, uid);
             }
-            if (active) schedule();
+            // 自动续轮询不调用 schedule()，避免每次续扫重置截止时间而变成无限扫描。
+            if (active) {
+                // 自动排队同样要占用调度标志，防止重绑/配置广播再开一条扫描链。
+                scheduled = true;
+                handler.postDelayed(REFRESH, POLL_INTERVAL_MS);
+            }
         }
     };
+    /** 只在当前账号的该条消息确实被标记时展示，列表回收时移除旧标记。 */
     static final class Binding extends RecallVisibility implements View.OnLayoutChangeListener {
         final String uid, chat, id;
         Border border;
         CharSequence description, markedDescription;
+        int originalBottom;
+        boolean hintMode;
         Binding(View view, String uid, String chat, String id) { super(view); this.uid = uid; this.chat = chat; this.id = id; }
         void refresh(View view, String activeUid) {
             boolean show = Config.antirecall && Config.showRecallHint && AntiRecall.TAMPER != 2
                     && uid.equals(activeUid) && RecallMessages.marked(uid, chat, id);
             if (!show) { remove(view); return; }
             if (border == null) {
-                boolean dark = (view.getResources().getConfiguration().uiMode
-                        & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
-                        == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-                border = new Border(view, view.getResources().getDisplayMetrics().density, dark);
+                originalBottom = view.getPaddingBottom();
+                border = new Border(view, view.getResources().getDisplayMetrics().density);
                 view.getOverlay().add(border);
                 description = view.getContentDescription();
                 markedDescription = (description == null ? "" : description + "，") + "已撤回，原文已保留";
                 view.setContentDescription(markedDescription);
             }
+            // 提示模式给文案预留独立空间，避免覆盖正文；颜色模式恢复宿主布局。
+            boolean nextHint = Config.recallDisplayMode == Config.RECALL_MODE_HINT;
+            int bottom = originalBottom + (nextHint ? Math.round(22 * view.getResources().getDisplayMetrics().density) : 0);
+            if (view.getPaddingBottom() != bottom)
+                view.setPadding(view.getPaddingLeft(), view.getPaddingTop(), view.getPaddingRight(), bottom);
+            hintMode = nextHint;
+            border.hintMode = hintMode;
+            border.setColor(Config.recallBorderColor);
             border.setBounds(0, 0, view.getWidth(), view.getHeight());
             border.invalidateSelf(); // grouping can change corner radii without changing size
         }
@@ -148,6 +181,7 @@ final class RecallBubbleUi {
             if (border == null) return;
             view.getOverlay().remove(border);
             border = null;
+            view.setPadding(view.getPaddingLeft(), view.getPaddingTop(), view.getPaddingRight(), originalBottom);
             if (markedDescription.equals(view.getContentDescription())) view.setContentDescription(description);
         }
         @Override public void onViewAttachedToWindow(View view) {
@@ -158,6 +192,7 @@ final class RecallBubbleUi {
             if (border != null) border.setBounds(0, 0, v.getWidth(), v.getHeight());
         }
     }
+    /** 根据宿主真实气泡轮廓绘制可换色的虚线，不改正文和点击区域。 */
     static final class Border extends Drawable {
         final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         final float density;
@@ -165,22 +200,47 @@ final class RecallBubbleUi {
         final Matrix transform = new Matrix();
         final RectF source = new RectF(), target = new RectF();
         final java.lang.ref.WeakReference<View> host;
-        Border(View view, float density, boolean dark) {
+        Border(View view, float density) {
             host = new java.lang.ref.WeakReference<View>(view);
             this.density = density;
-            paint.setColor(dark ? 0xff707070 : 0xffb0b0b0);
+            setColor(Config.recallBorderColor);
             paint.setStyle(Paint.Style.STROKE);
             paint.setStrokeWidth(1.5f * density);
             paint.setPathEffect(new DashPathEffect(new float[]{4 * density, 3 * density}, 0));
         }
+        void setColor(String color) {
+            int value = android.graphics.Color.parseColor(Config.sanitizeRecallBorderColor(color));
+            if (paint.getColor() != value) { paint.setColor(value); invalidateSelf(); }
+        }
+        boolean hintMode;
+        final android.text.TextPaint hintPaint = new android.text.TextPaint(Paint.ANTI_ALIAS_FLAG);
+        String cachedHint;
+        int cachedWidth = -1;
+        CharSequence fittedHint;
         @Override public void draw(Canvas canvas) {
             View view = host.get();
+            if (hintMode && view != null) {
+                String hint = Config.recallHintText;
+                if (hint == null || hint.trim().isEmpty()) hint = "撤回了一条消息";
+                // 此处没有可靠的发送人字段，移除占位符，不从通知存档猜发送人。
+                hint = hint.replace("{name}", "").replace("{sender}", "").replace('\n', ' ');
+                hintPaint.setColor(0xFF888888);
+                hintPaint.setTextSize(11 * density);
+                // 只在文案或宽度变化时省略文本，避免每一帧重复分配布局对象。
+                if (!hint.equals(cachedHint) || cachedWidth != view.getWidth()) {
+                    cachedHint = hint;
+                    cachedWidth = view.getWidth();
+                    fittedHint = android.text.TextUtils.ellipsize(hint, hintPaint,
+                            Math.max(0, cachedWidth - 12 * density), android.text.TextUtils.TruncateAt.END);
+                }
+                canvas.drawText(fittedHint.toString(), 6 * density, view.getHeight() - 7 * density, hintPaint);
+                return;
+            }
             float inset = paint.getStrokeWidth() / 2;
             if (view == null || outline == null || getBounds().width() <= 2 * inset
                     || getBounds().height() <= 2 * inset) return;
             try {
-                // Ask for precisely the bounds the host itself uses. Fractional
-                // inset bounds collide in its integer-keyed global Path cache.
+                // 先取宿主实际使用的整数边界，再缩放私有 Path；小数边界会撞宿主缓存键。
                 int width = view.getWidth(), height = view.getHeight();
                 Path cached = (Path) outline.invoke(view, 0f, 0f, (float) width, (float) height);
                 path.set(cached);

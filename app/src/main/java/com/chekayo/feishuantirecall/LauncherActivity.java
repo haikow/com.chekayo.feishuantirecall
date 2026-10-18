@@ -13,17 +13,30 @@ import android.widget.FrameLayout;
 public class LauncherActivity extends Activity {
     private android.content.BroadcastReceiver configReceiver;
     private FrameLayout host;
+    private final android.os.Handler ui = new android.os.Handler(android.os.Looper.getMainLooper());
+    private boolean resumed;
+    private final Runnable refresh = new Runnable() {
+        @Override public void run() { if (resumed) refreshPage(); }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        getWindow().setStatusBarColor(Ui.bg(this));
+        getWindow().setNavigationBarColor(Ui.bg(this));
+        if (android.os.Build.VERSION.SDK_INT >= 23) getWindow().getDecorView().setSystemUiVisibility(
+                Ui.isNight(this) ? 0 : android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                        | (android.os.Build.VERSION.SDK_INT >= 26 ? android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR : 0));
         Config.setFilesDir(getFilesDir());
         Config.setContext(this);
         configReceiver = new android.content.BroadcastReceiver() {
             @Override public void onReceive(android.content.Context c, android.content.Intent i) {
                 if (!Config.ACTION_SYNC.equals(i.getAction())) return;
                 // 接收飞书进程的配置；只 apply，不在此重建 UI（避免 onReceive 里 removeAllViews 掉帧）
-                Config.onSyncReceive(i.getStringExtra("json"));
+                if (Config.onSyncReceive(i.getStringExtra("json"))) {
+                    ui.removeCallbacks(refresh);
+                    ui.postDelayed(refresh, 250);
+                }
             }
         };
         android.content.IntentFilter configFilter = new android.content.IntentFilter(Config.ACTION_SYNC);
@@ -47,6 +60,17 @@ public class LauncherActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        resumed = true;
+        refreshPage();
+    }
+
+    @Override protected void onPause() {
+        resumed = false;
+        ui.removeCallbacks(refresh);
+        super.onPause();
+    }
+
+    private void refreshPage() {
         // 从无障碍设置返回后刷新巡游开关状态
         if (host == null) return;
         try {

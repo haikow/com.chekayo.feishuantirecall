@@ -22,8 +22,8 @@ import android.os.Bundle;
  * 2. 接收端只 apply，绝不回推（回推曾导致广播风暴）；
  * 3. apply 保留对端 updatedAt，不抬到 now（否则双方永远"我更新"）；
  * 4. 不向本包名广播；
- * 5. 飞书启动经 ContentProvider 拉模块权威配置一次；
- * 6. 广播带最小间隔防抖，避免多进程启动连环发送。
+ * 5. 飞书经 ContentProvider 合并单项改动，并每两秒拉取模块权威配置；
+ * 6. 连续广播合并发送最新快照，不丢弃最后一次改动。
  */
 public class Config {
     public static final String ACTION_SYNC = "com.chekayo.feishuantirecall.CONFIG_SYNC";
@@ -48,16 +48,32 @@ public class Config {
     public static volatile boolean updatebanner = true;  // 主页顶部更新横幅(有新版时提示)
     public static volatile int dismissedUpc = 0;         // 已忽略的更新 versionCode(× 关闭后记住, 不再唠叨)
     public static volatile boolean blockaipeek = true;   // 屏蔽 AI 总结「消息速览」浮层（整条）
+    public static volatile boolean blockrelatedknowledge = true;  // 屏蔽消息中的「相关知识」AI推荐卡片
+    public static volatile boolean messageTimeAlways = false;
+    public static volatile boolean messageTimeFormatting = false;
+    public static volatile String messageTimePattern = MessageTimeFormat.DEFAULT;
     // ── 防撤回展示选项 ──
+    public static final int RECALL_MODE_HINT = 0;
+    public static final int RECALL_MODE_COLOR = 1;
+    public static volatile int recallDisplayMode = RECALL_MODE_COLOR;
     public static volatile boolean showRecallHint = true;      // 原气泡撤回标记（兼容旧版配置键）
+    public static final String DEFAULT_RECALL_BORDER_COLOR = "#E5484D";
+    public static volatile String recallBorderColor = DEFAULT_RECALL_BORDER_COLOR;
     public static volatile boolean recallHintOriginal = true;  // 撤回提示是否附带原文
     public static volatile String recallHintText = "撤回了一条消息"; // 可自定义提示文案（可用 {name} 代表发送人）
 
     // 由 AntiRecall.startNative / LauncherActivity / SettingsPanel 调 setFilesDir 初始化(按当前目标包, 国内/国际版自适应)。
     static volatile File cfgFile;
-    /** 防抖：避免 onResume / 多进程启动时连环 broadcast。 */
-    private static volatile long lastBroadcastAt;
-    private static final long BROADCAST_MIN_INTERVAL_MS = 400;
+    private static android.os.Handler mainHandler;
+    private static boolean broadcastPending;
+    private static boolean polling;
+    private static JSONObject pendingEdits;
+    private static JSONObject pendingEdits() {
+        if (pendingEdits == null) pendingEdits = new JSONObject();
+        return pendingEdits;
+    }
+    private static volatile String syncError = "";
+    static final String MODULE_PKG = "com.chekayo.feishuantirecall";
 
     /** 保存应用级 Context，用于向飞书进程发送配置同步广播。 */
     public static void setContext(Context c) { if (c != null) appContext = c.getApplicationContext(); }
@@ -103,9 +119,15 @@ public class Config {
             o.put("screenshotnoaudit",screenshotnoaudit); o.put("forcescreenshot",forcescreenshot); o.put("noauditall",noauditall);
             o.put("pubdownloadSubdir",pubdownloadSubdir); o.put("updatebanner",updatebanner); o.put("dismissedUpc",dismissedUpc);
             o.put("showRecallHint", showRecallHint);
+            o.put("recallDisplayMode", recallDisplayMode);
+            o.put("recallBorderColor", recallBorderColor);
             o.put("recallHintOriginal", recallHintOriginal);
             o.put("recallHintText", recallHintText);
             o.put("blockaipeek", blockaipeek);
+            o.put("blockrelatedknowledge", blockrelatedknowledge);
+            o.put("messageTimeAlways", messageTimeAlways);
+            o.put("messageTimeFormatting", messageTimeFormatting);
+            o.put("messageTimePattern", messageTimePattern);
             return o.toString();
         } catch (Throwable t) { return "{}"; }
     }
@@ -130,10 +152,17 @@ public class Config {
             screenshotnoaudit=o.optBoolean("screenshotnoaudit",false); forcescreenshot=o.optBoolean("forcescreenshot",false); noauditall=o.optBoolean("noauditall",false);
             pubdownloadSubdir=o.optString("pubdownloadSubdir","Lark"); updatebanner=o.optBoolean("updatebanner",true); dismissedUpc=o.optInt("dismissedUpc",0);
             showRecallHint = o.optBoolean("showRecallHint", true);
+            recallDisplayMode = sanitizeRecallDisplayMode(o.optInt("recallDisplayMode", RECALL_MODE_COLOR));
+            recallBorderColor = sanitizeRecallBorderColor(o.optString("recallBorderColor", DEFAULT_RECALL_BORDER_COLOR));
             recallHintOriginal = o.optBoolean("recallHintOriginal", true);
             recallHintText = o.optString("recallHintText", "撤回了一条消息");
             blockaipeek = o.optBoolean("blockaipeek", true);
+            blockrelatedknowledge = o.optBoolean("blockrelatedknowledge", true);
+            messageTimeAlways = o.optBoolean("messageTimeAlways", false);
+            messageTimeFormatting = o.optBoolean("messageTimeFormatting", false);
+            messageTimePattern = sanitizeTimePattern(o.optString("messageTimePattern", MessageTimeFormat.DEFAULT));
             save();
+            notifyHooks();
             return true;
         } catch (Throwable t) { return false; }
     }
@@ -178,9 +207,16 @@ public class Config {
                 updatebanner = o.optBoolean("updatebanner", true);
                 dismissedUpc = o.optInt("dismissedUpc", 0);
                 showRecallHint = o.optBoolean("showRecallHint", true);
+                recallDisplayMode = sanitizeRecallDisplayMode(o.optInt("recallDisplayMode", RECALL_MODE_COLOR));
+                recallBorderColor = sanitizeRecallBorderColor(o.optString("recallBorderColor", DEFAULT_RECALL_BORDER_COLOR));
                 recallHintOriginal = o.optBoolean("recallHintOriginal", true);
                 recallHintText = o.optString("recallHintText", "撤回了一条消息");
                 blockaipeek = o.optBoolean("blockaipeek", true);
+                blockrelatedknowledge = o.optBoolean("blockrelatedknowledge", true);
+            messageTimeAlways = o.optBoolean("messageTimeAlways", false);
+            messageTimeFormatting = o.optBoolean("messageTimeFormatting", false);
+            messageTimePattern = sanitizeTimePattern(o.optString("messageTimePattern", MessageTimeFormat.DEFAULT));
+                notifyHooks();
             } else {
                 // 首次无本地文件：不立刻 save（多进程会互相覆盖成默认值）。由 sync 对齐后再落盘。
             }
@@ -189,6 +225,7 @@ public class Config {
 
     /** 修改单个布尔配置并立即持久化、广播同步。值未变则不写不广播。 */
     public static synchronized void set(String key, boolean v) {
+        prepareEdit();
         boolean changed = false;
         if ("antirecall".equals(key)) { changed = antirecall != v; antirecall = v; }
         else if ("resign".equals(key)) { changed = resign != v; resign = v; }
@@ -209,22 +246,35 @@ public class Config {
         else if ("showRecallHint".equals(key)) { changed = showRecallHint != v; showRecallHint = v; }
         else if ("recallHintOriginal".equals(key)) { changed = recallHintOriginal != v; recallHintOriginal = v; }
         else if ("blockaipeek".equals(key)) { changed = blockaipeek != v; blockaipeek = v; }
+        else if ("blockrelatedknowledge".equals(key)) { changed = blockrelatedknowledge != v; blockrelatedknowledge = v; }
+        else if ("messageTimeFormatting".equals(key)) { changed = messageTimeFormatting != v; messageTimeFormatting = v; }
+        else if ("messageTimeAlways".equals(key)) { changed = messageTimeAlways != v; messageTimeAlways = v; }
         if (!changed) return;
-        updatedAt = System.currentTimeMillis();
-        save();
-        broadcast();
+        commitEdit(key, Boolean.valueOf(v));
     }
 
     public static synchronized void setDismissed(int vc) {
+        prepareEdit();
         if (dismissedUpc == vc) return;
         dismissedUpc = vc;
-        updatedAt = System.currentTimeMillis();
-        save();
-        broadcast();
+        commitEdit("dismissedUpc", Integer.valueOf(vc));
+    }
+
+    public static synchronized void setRecallDisplayMode(int mode) {
+        prepareEdit();
+        int next = sanitizeRecallDisplayMode(mode);
+        if (recallDisplayMode == next) return;
+        recallDisplayMode = next;
+        commitEdit("recallDisplayMode", Integer.valueOf(next));
+    }
+
+    static int sanitizeRecallDisplayMode(int mode) {
+        return mode == RECALL_MODE_HINT ? RECALL_MODE_HINT : RECALL_MODE_COLOR;
     }
 
     // 字符串配置(目前仅 pubdownloadSubdir / recallHintText)。子目录名做基本清洗。
     public static synchronized void setStr(String key, String v) {
+        prepareEdit();
         if ("pubdownloadSubdir".equals(key)) {
             String nv = sanitizeSubdir(v);
             if (nv.equals(pubdownloadSubdir)) return;
@@ -233,12 +283,29 @@ public class Config {
             String nv = sanitizeRecallHint(v);
             if (nv.equals(recallHintText)) return;
             recallHintText = nv;
+        } else if ("messageTimePattern".equals(key)) {
+            String nv = sanitizeTimePattern(v);
+            if (nv.equals(messageTimePattern)) return;
+            messageTimePattern = nv;
+        } else if ("recallBorderColor".equals(key)) {
+            String nv = sanitizeRecallBorderColor(v);
+            if (nv.equals(recallBorderColor)) return;
+            recallBorderColor = nv;
         } else {
             return;
         }
-        updatedAt = System.currentTimeMillis();
-        save();
-        broadcast();
+        commitEdit(key, "pubdownloadSubdir".equals(key) ? pubdownloadSubdir
+                : "messageTimePattern".equals(key) ? messageTimePattern
+                : "recallBorderColor".equals(key) ? recallBorderColor : recallHintText);
+    }
+
+    static String sanitizeRecallBorderColor(String value) {
+        if (value == null || !value.matches("#[0-9a-fA-F]{6}")) return DEFAULT_RECALL_BORDER_COLOR;
+        return value.toUpperCase(java.util.Locale.US);
+    }
+
+    static String sanitizeTimePattern(String value) {
+        return MessageTimeFormat.valid(value) ? value.trim() : MessageTimeFormat.DEFAULT;
     }
 
     /** 撤回提示文案清洗：去空白，默认「撤回了一条消息」；保留 {name}/{sender} 占位。 */
@@ -250,20 +317,23 @@ public class Config {
         return s;
     }
 
-    /** 向国内版、国际版飞书和模块自身发送最新配置（跨应用，接收端须 EXPORTED）。不发本包。 */
-    public static void broadcast() {
-        try {
-            Context c = appContext;
-            if (c == null) return;
-            long now = System.currentTimeMillis();
-            if (now - lastBroadcastAt < BROADCAST_MIN_INTERVAL_MS) return;
-            lastBroadcastAt = now;
-            String json = snapshot();
-            String self = c.getPackageName();
-            if (!"com.ss.android.lark".equals(self)) sendTo(c, "com.ss.android.lark", json);
-            if (!"com.larksuite.suite".equals(self)) sendTo(c, "com.larksuite.suite", json);
-            if (!"com.chekayo.feishuantirecall".equals(self)) sendTo(c, "com.chekayo.feishuantirecall", json);
-        } catch (Throwable ignored) {}
+    /** 合并连续改动后发送最新快照，最后一次改动一定送出。 */
+    public static synchronized void broadcast() {
+        if (broadcastPending) return;
+        broadcastPending = true;
+        if (mainHandler == null) mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+        mainHandler.postDelayed(new Runnable() {
+            @Override public void run() {
+                synchronized (Config.class) { broadcastPending = false; }
+                Context c = appContext;
+                if (c == null) return;
+                String json = snapshot();
+                String self = c.getPackageName();
+                if (!"com.ss.android.lark".equals(self)) sendTo(c, "com.ss.android.lark", json);
+                if (!"com.larksuite.suite".equals(self)) sendTo(c, "com.larksuite.suite", json);
+                if (!MODULE_PKG.equals(self)) sendTo(c, MODULE_PKG, json);
+            }
+        }, 100);
     }
 
     private static void sendTo(Context c, String pkg, String json) {
@@ -299,28 +369,137 @@ public class Config {
      * 模块进程：no-op（自己就是权威源）。
      */
     public static synchronized void syncWithProvider() {
+        Context c = appContext;
+        if (c == null || MODULE_PKG.equals(c.getPackageName())) return;
         try {
-            Context c = appContext;
-            if (c == null) return;
-            if ("com.chekayo.feishuantirecall".equals(c.getPackageName())) return;
-            Bundle b = c.getContentResolver().call(ConfigProvider.URI, "get", null, null);
-            if (b == null) return;
-            String remote = b.getString("json");
-            if (remote == null || remote.isEmpty()) return;
-            long remoteTs = 0;
-            try { remoteTs = new JSONObject(remote).optLong("updatedAt", 0); } catch (Throwable ignored) {}
-            // 本地无有效时间戳(0) 或对端更新 → 采用对端（模块为权威源）
-            if (remoteTs > updatedAt || (updatedAt <= 0 && remoteTs > 0)) {
-                boolean ok = applySnapshot(remote);
-                try { android.util.Log.i("fucklark", "sync pull ok=" + ok + " remoteTs=" + remoteTs + " localWas=" + updatedAt); } catch (Throwable ignored) {}
-            } else if (updatedAt > 0 && remoteTs < updatedAt) {
-                // 本地更新 → 写回模块权威源
-                Bundle put = new Bundle();
-                put.putString("json", snapshot());
-                c.getContentResolver().call(ConfigProvider.URI, "put", null, put);
+            loadPendingEdits();
+            if (pendingEdits().length() > 0) {
+                Bundle patch = new Bundle();
+                patch.putString("json", pendingEdits().toString());
+                Bundle applied = c.getContentResolver().call(ConfigProvider.URI, "patch", null, patch);
+                if (applied == null || applied.getString("json") == null) throw new IllegalStateException("配置源无响应");
+                acceptAuthority(applied.getString("json"));
+                clearPendingEdits();
             }
+            Bundle info = new Bundle();
+            info.putString("package", c.getPackageName());
+            info.putString("process", android.os.Build.VERSION.SDK_INT >= 28
+                    ? android.app.Application.getProcessName() : c.getPackageName());
+            info.putString("version", ModuleBuild.VERSION);
+            info.putString("build", ModuleBuild.BUILD);
+            info.putInt("versionCode", ModuleBuild.VERSION_CODE);
+            info.putLong("updatedAt", updatedAt);
+            Bundle b = c.getContentResolver().call(ConfigProvider.URI, "get", null, info);
+            if (b == null || b.getString("json") == null) throw new IllegalStateException("配置源无响应");
+            String remote = b.getString("json");
+            if (!remote.equals(snapshot())) acceptAuthority(remote);
+            syncError = "";
+        } catch (Throwable t) {
+            String nextError = String.valueOf(t);
+            if (!nextError.equals(syncError)) android.util.Log.w("fucklark", "配置同步失败: " + t);
+            syncError = nextError;
+        }
+    }
+
+    private static void acceptAuthority(String json) {
+        // 模块 Provider 为权威源；迁移旧版副本时不能让飞书的文件时间覆盖桌面设置。
+        updatedAt = 0;
+        applySnapshot(json);
+    }
+
+    private static void prepareEdit() {
+        Context c = appContext;
+        if (c == null) return;
+        if (MODULE_PKG.equals(c.getPackageName())) load();
+        else syncWithProvider();
+    }
+
+    private static void commitEdit(String key, Object value) {
+        Context c = appContext;
+        if (c != null && !MODULE_PKG.equals(c.getPackageName())) {
+            try { pendingEdits().put(key, value); persistPendingEdits(); }
+            catch (Throwable t) { android.util.Log.w("fucklark", "待同步配置保存失败: " + t); }
+            syncWithProvider();
+            if (pendingEdits().length() == 0) return;
+        }
+        updatedAt = Math.max(System.currentTimeMillis(), updatedAt + 1);
+        save();
+        notifyHooks();
+        // 离线的飞书编辑不广播整份陈旧快照；恢复连接后只合并用户改过的字段。
+        if (c == null || MODULE_PKG.equals(c.getPackageName())) broadcast();
+    }
+
+    /** Provider 内串行合并单项改动，避免两个进程的旧快照互相覆盖。 */
+    static synchronized String applyPatch(String json) throws Exception {
+        load();
+        JSONObject current = new JSONObject(snapshot());
+        JSONObject patch = new JSONObject(json);
+        java.util.Iterator<String> keys = patch.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            if ("updatedAt".equals(key) || !current.has(key)) continue;
+            Object old = current.get(key), value = patch.get(key);
+            if ((old instanceof Boolean && value instanceof Boolean)
+                    || (old instanceof Number && value instanceof Number)
+                    || (old instanceof String && value instanceof String)) current.put(key, value);
+        }
+        current.put("pubdownloadSubdir", sanitizeSubdir(current.optString("pubdownloadSubdir", "Lark")));
+        current.put("recallHintText", sanitizeRecallHint(current.optString("recallHintText", "撤回了一条消息")));
+        current.put("recallDisplayMode", sanitizeRecallDisplayMode(current.optInt("recallDisplayMode", RECALL_MODE_COLOR)));
+        current.put("recallBorderColor", sanitizeRecallBorderColor(current.optString("recallBorderColor", DEFAULT_RECALL_BORDER_COLOR)));
+        current.put("messageTimePattern", sanitizeTimePattern(current.optString("messageTimePattern", MessageTimeFormat.DEFAULT)));
+        current.put("updatedAt", Math.max(System.currentTimeMillis(), updatedAt + 1));
+        applySnapshot(current.toString());
+        broadcast();
+        return snapshot();
+    }
+
+    private static File pendingFile() {
+        return cfgFile == null ? null : new File(cfgFile.getParentFile(), "fucklark_cfg_pending.json");
+    }
+    private static void loadPendingEdits() throws Exception {
+        File f = pendingFile();
+        if (f == null || !f.exists()) return;
+        JSONObject saved = new JSONObject(read(f));
+        java.util.Iterator<String> keys = saved.keys();
+        while (keys.hasNext()) { String key = keys.next(); if (!pendingEdits().has(key)) pendingEdits().put(key, saved.get(key)); }
+    }
+    private static void persistPendingEdits() throws Exception {
+        File f = pendingFile();
+        if (f != null) { f.getParentFile().mkdirs(); write(f, pendingEdits().toString()); }
+    }
+    private static void clearPendingEdits() {
+        java.util.Iterator<String> keys = pendingEdits().keys();
+        while (keys.hasNext()) { keys.next(); keys.remove(); }
+        File f = pendingFile();
+        if (f != null) f.delete();
+    }
+
+    private static void notifyHooks() {
+        Context c = appContext;
+        if (c == null || MODULE_PKG.equals(c.getPackageName())) return;
+        try { RecallBubbleUi.schedule(); } catch (Throwable ignored) {}
+        try { RelatedKnowledgeBlock.onConfigChanged(); } catch (Throwable ignored) {}
+        try { MessageTimeDisplay.onConfigChanged(); } catch (Throwable ignored) {}
+        try {
+            AntiRecall.nativeSetRecall(antirecall);
+            AntiRecall.nativeSetDiag(diaglog);
+            AntiRecall.nativeSetKeepKicked(keepkicked);
+            AntiRecall.nativeSetLeaveNotify(leavenotify);
         } catch (Throwable ignored) {}
     }
+
+    /** 广播被系统拦截时的补偿通道，不在 UI 线程轮询。 */
+    static synchronized void startPolling() {
+        if (polling || appContext == null || MODULE_PKG.equals(appContext.getPackageName())) return;
+        polling = true;
+        java.util.concurrent.ScheduledExecutorService worker = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
+        worker.scheduleWithFixedDelay(new Runnable() {
+            @Override public void run() { syncWithProvider(); }
+        }, 2, 10, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    static String syncError() { return syncError; }
 
     /** @deprecated 旧名，保留兼容 */
     public static void pullFromProvider() { syncWithProvider(); }
@@ -359,9 +538,15 @@ public class Config {
             o.put("updatebanner", updatebanner);
             o.put("dismissedUpc", dismissedUpc);
             o.put("showRecallHint", showRecallHint);
+            o.put("recallDisplayMode", recallDisplayMode);
+            o.put("recallBorderColor", recallBorderColor);
             o.put("recallHintOriginal", recallHintOriginal);
             o.put("recallHintText", recallHintText);
             o.put("blockaipeek", blockaipeek);
+            o.put("blockrelatedknowledge", blockrelatedknowledge);
+            o.put("messageTimeAlways", messageTimeAlways);
+            o.put("messageTimeFormatting", messageTimeFormatting);
+            o.put("messageTimePattern", messageTimePattern);
             File dir = cfgFile.getParentFile();
             if (dir != null && !dir.isDirectory()) dir.mkdirs();   // 定制飞书 files 目录可能尚未创建
             write(cfgFile, o.toString());
@@ -378,8 +563,14 @@ public class Config {
         is.close(); return new String(b, 0, off, "UTF-8");
     }
     static void write(File f, String s) throws Exception {
-        FileOutputStream os = new FileOutputStream(f);
-        os.write(s.getBytes("UTF-8")); os.flush(); os.close();
-        f.setReadable(true, false);
+        File temp = new File(f.getParentFile(), f.getName() + ".tmp."
+                + android.os.Process.myPid() + "." + Thread.currentThread().getId());
+        try {
+            FileOutputStream os = new FileOutputStream(temp);
+            try { os.write(s.getBytes("UTF-8")); os.flush(); os.getFD().sync(); }
+            finally { os.close(); }
+            if (!temp.renameTo(f)) throw new java.io.IOException("无法替换配置文件 " + f);
+            f.setReadable(true, false);
+        } finally { if (temp.exists()) temp.delete(); }
     }
 }

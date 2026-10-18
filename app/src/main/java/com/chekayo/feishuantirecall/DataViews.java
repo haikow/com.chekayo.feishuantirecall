@@ -559,6 +559,7 @@ final class DataViews {
     /** 富列表: 离职名单 join 资料档案, 每行点击打开资料页；顶部搜索实时过滤。 */
     static void showResignedList(final Context ctx) {
         try {
+            ArchiveSync.requestRefresh(ctx);
             File rf = archiveFile("resigned_all.json");
             File pf = archiveFile("profiles.json");
             final JSONObject resigned = rf.exists() ? new JSONObject(Config.read(rf)) : new JSONObject();
@@ -602,11 +603,55 @@ final class DataViews {
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
             rootv.addView(sv, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-            new AlertDialog.Builder(ctx)
+            final AlertDialog dialog = new AlertDialog.Builder(ctx)
                     .setTitle("离职名单（" + ids.size() + " 人）")
                     .setView(rootv)
+                    .setNeutralButton("刷新", null)
                     .setPositiveButton("关闭", null)
                     .show();
+            Ui.styleDialog(dialog);
+            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { ArchiveSync.requestRefresh(ctx); }
+            });
+            final android.os.Handler refreshHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+            final long[] revision = { rf.lastModified(), pf.lastModified() };
+            final Runnable reload = new Runnable() {
+                @Override public void run() {
+                    if (!dialog.isShowing()) return;
+                    try {
+                        File latest = archiveFile("resigned_all.json");
+                        File details = archiveFile("profiles.json");
+                        if (latest.lastModified() != revision[0] || details.lastModified() != revision[1]) {
+                            JSONObject next = latest.exists() ? new JSONObject(Config.read(latest)) : new JSONObject();
+                            JSONObject nextProfiles = details.exists() ? new JSONObject(Config.read(details)) : new JSONObject();
+                            idsF.clear();
+                            Iterator<String> keys = resignedF.keys();
+                            while (keys.hasNext()) { keys.next(); keys.remove(); }
+                            keys = profilesF.keys();
+                            while (keys.hasNext()) { keys.next(); keys.remove(); }
+                            keys = next.keys();
+                            while (keys.hasNext()) { String key = keys.next(); resignedF.put(key, next.get(key)); idsF.add(key); }
+                            keys = nextProfiles.keys();
+                            while (keys.hasNext()) { String key = keys.next(); profilesF.put(key, nextProfiles.get(key)); }
+                            Collections.sort(idsF, new Comparator<String>() {
+                                @Override public int compare(String a, String b) {
+                                    return Long.compare(optLong(resignedF.optJSONObject(b), "update_time"),
+                                            optLong(resignedF.optJSONObject(a), "update_time"));
+                                }
+                            });
+                            populateResigned(ctx, box, idsF, resignedF, profilesF, System.currentTimeMillis() / 1000,
+                                    search.getText().toString());
+                            dialog.setTitle("离职名单（" + idsF.size() + " 人）");
+                            revision[0] = latest.lastModified(); revision[1] = details.lastModified();
+                        }
+                    } catch (Throwable t) { android.util.Log.w("fucklark", "离职名单刷新失败", t); }
+                    refreshHandler.postDelayed(this, 2000);
+                }
+            };
+            refreshHandler.postDelayed(reload, 2000);
+            dialog.setOnDismissListener(new android.content.DialogInterface.OnDismissListener() {
+                @Override public void onDismiss(android.content.DialogInterface d) { refreshHandler.removeCallbacks(reload); }
+            });
         } catch (Throwable t) {
             android.util.Log.w("FeishuKit", "showResignedList err " + t);
         }
@@ -1082,27 +1127,6 @@ final class DataViews {
         } catch (Throwable t) { return null; }
     }
 
-    /** 当前模块版本: 反射读 AntiRecall 权威源, 避免多处硬编码版本号漂移导致「检查更新」误报新版;
-     *  桌面进程 AntiRecall 若加载失败, 回退兜底值(发布时与 Manifest 同步)。 */
-    static String moduleVersion() {
-        try {
-            Class<?> c = Class.forName("com.chekayo.feishuantirecall.AntiRecall");
-            java.lang.reflect.Field f = c.getDeclaredField("MODULE_VERSION");
-            f.setAccessible(true);
-            Object v = f.get(null);
-            if (v != null) return String.valueOf(v);
-        } catch (Throwable ignored) {}
-        return "1.8.5";
-    }
-
-    static int moduleVersionCode() {
-        try {
-            Class<?> c = Class.forName("com.chekayo.feishuantirecall.AntiRecall");
-            java.lang.reflect.Field f = c.getDeclaredField("MODULE_VERSION_CODE");
-            f.setAccessible(true);
-            Object v = f.get(null);
-            if (v instanceof Integer) return (Integer) v;
-        } catch (Throwable ignored) {}
-        return 27;
-    }
+    static String moduleVersion() { return ModuleBuild.VERSION; }
+    static int moduleVersionCode() { return ModuleBuild.VERSION_CODE; }
 }

@@ -7,7 +7,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/** Memory-only queries; one worker loads and batches durable account indexes. */
+/** 撤回标记按账号异步落盘；UI 查询只读内存索引，不等待磁盘。 */
 final class RecallMarkStore {
     interface Disk {
         String[] accounts(File directory);
@@ -122,6 +122,7 @@ final class RecallMarkStore {
             public void run() { flush(); }
         }, delay, TimeUnit.MILLISECONDS);
     }
+    /** 同一后台线程合并写入，失败保留 dirty 等下一轮重试。 */
     private void flush() {
         for (String uid : new ArrayList<String>(dirty)) {
             if (!dirty.remove(uid)) continue;

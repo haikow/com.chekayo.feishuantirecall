@@ -12,7 +12,7 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import io.github.libxposed.api.XposedInterface;
 
-/** Retained content is local history, not a valid server-side reply/reaction target. */
+/** 保留的原文只供查看/复制/下载，不再作为回复、转发或表情的服务端目标。 */
 final class RecallActionGuard {
     private static final String MESSAGE = "com.ss.android.lark.chat.entity.message.Message";
     private static final String CONTEXT = "com.ss.android.lark.biz.im.extension.message_action.a";
@@ -87,11 +87,11 @@ final class RecallActionGuard {
     }
     static void install(ClassLoader cl) {
         try { installMenuPolicy(cl); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall menu policy unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall menu policy unavailable: " + t); }
         try { installSwipePolicy(cl); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall swipe policy unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall swipe policy unavailable: " + t); }
         try { installThreadReactions(cl.loadClass("com.ss.android.lark.replyinthread.pages.normal.ReplyInThreadViewModel"), cl.loadClass(MESSAGE)); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall thread reaction guard unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall thread reaction guard unavailable: " + t); }
         String[] actions = {
             "com.ss.android.lark.chat.message.menu.provider.ChatReplyActionProvider$ReplyMessageAction",
             "com.ss.android.lark.chat.messagemenu.provider.ChatThreadReplyActionProvider$ReplyMessageAction",
@@ -121,8 +121,8 @@ final class RecallActionGuard {
             Method click = action.getDeclaredMethod("a", View.class, boolean.class);
             if (click.getReturnType() != void.class) throw new NoSuchMethodException("action click");
             HookRuntime.hook(click, "recall.action." + name + ".click", new Guard(target, false));
-            ModuleLog.log("[fucklark] recall action guard: " + name);
-        } catch (Throwable t) { ModuleLog.log("[fucklark] recall action guard unavailable: " + name + ": " + t); }
+            Diag.once("[fucklark] recall action guard: " + name);
+        } catch (Throwable t) { Diag.once("[fucklark] recall action guard unavailable: " + name + ": " + t); }
 
         for (String name : new String[]{
                 "com.ss.android.lark.chat.chatwindow.chat.menu.handler.ReactionHandler",
@@ -157,8 +157,8 @@ final class RecallActionGuard {
                 throw new NoSuchMethodException("reaction entry shape");
             HookRuntime.hook(toggle, "recall.action." + name + ".toggle", new Guard(target, false));
             HookRuntime.hook(more, "recall.action." + name + ".more", new Guard(target, false));
-            ModuleLog.log("[fucklark] recall reaction guard: " + name);
-        } catch (Throwable t) { ModuleLog.log("[fucklark] recall reaction guard unavailable: " + name + ": " + t); }
+            Diag.once("[fucklark] recall reaction guard: " + name);
+        } catch (Throwable t) { Diag.once("[fucklark] recall reaction guard unavailable: " + name + ": " + t); }
     }
 
     static void installThreadReactions(Class<?> type, Class<?> message) throws Throwable {
@@ -183,7 +183,7 @@ final class RecallActionGuard {
         }
     }
 
-    /** Shared menu filter covers topics, forwarding, pinning and future actions too. */
+    /** 统一筛选消息菜单，新增的未知操作默认不可用于已撤回目标。 */
     private static void installMenuPolicy(ClassLoader cl) throws Throwable {
         Class<?> context = cl.loadClass(CONTEXT);
         Class<?> action = cl.loadClass("com.ss.android.lark.biz.im.extension.message_action.j");
@@ -207,14 +207,14 @@ final class RecallActionGuard {
                             return ctx != null && blockedAction(receiver, message.invoke(ctx));
                         }
                     }, false));
-                } catch (Throwable t) { ModuleLog.log("[fucklark] recall menu click guard unavailable: " + t.getClass().getSimpleName()); }
+                } catch (Throwable t) { Diag.once("[fucklark] recall menu click guard unavailable: " + t.getClass().getSimpleName()); }
                 try {
                     if (blockedAction(item, message.invoke(ctx))) return true; // host: true = exclude
                 } catch (Throwable ignored) {}
                 return chain.proceed();
             }
         });
-        ModuleLog.log("[fucklark] recall menu policy: content access only");
+        Diag.once("[fucklark] recall menu policy: content access only");
     }
 
     static Method findMethod(Class<?> type, Class<?> returns, Class<?>... params) throws NoSuchMethodException {
@@ -267,10 +267,10 @@ final class RecallActionGuard {
                             return ref != null && blockedMessage(ref.get());
                         }
                     }, false));
-                } catch (Throwable t) { ModuleLog.log("[fucklark] recall swipe invoke guard unavailable: " + t.getClass().getSimpleName()); }
+                } catch (Throwable t) { Diag.once("[fucklark] recall swipe invoke guard unavailable: " + t.getClass().getSimpleName()); }
                 return result;
             }
         });
-        ModuleLog.log("[fucklark] recall swipe policy: retained messages cannot be captured");
+        Diag.once("[fucklark] recall swipe policy: retained messages cannot be captured");
     }
 }

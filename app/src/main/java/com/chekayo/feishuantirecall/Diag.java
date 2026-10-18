@@ -41,6 +41,15 @@ public class Diag {
         } catch (Throwable ignored) {}
     }
 
+    private static final java.util.Set<String> EVENTS = new java.util.HashSet<String>();
+
+    /** 扫描与命中事件每进程去重，关闭诊断时不消耗记录额度。 */
+    static synchronized void once(String message) {
+        if (!Config.diaglog || FILE == null || EVENTS.contains(message) || EVENTS.size() >= 128) return;
+        EVENTS.add(message);
+        w(message);
+    }
+
     /** 超过上限时保留后半段(最近的日志更有价值)。 */
     static void truncate() {
         try {

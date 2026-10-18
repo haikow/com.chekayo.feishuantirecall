@@ -17,6 +17,9 @@ import com.chekayo.feishuantirecall.AntiRecall;
 import com.chekayo.feishuantirecall.HotReloadSafety;
 import com.chekayo.feishuantirecall.ProfileBulk;
 import com.chekayo.feishuantirecall.Reflect;
+import com.chekayo.feishuantirecall.HookRuntime;
+import com.chekayo.feishuantirecall.ModuleLog;
+import io.github.libxposed.api.XposedInterface;
 
 /**
  * 飞书离职统计 (com.ss.android.lark)
@@ -40,6 +43,60 @@ public class ResignTracker {
 
     static volatile String MODULE_PATH = null;
     static volatile boolean STARTED = false;
+
+    private static final Object REFRESH = new Object();
+    private static volatile long refreshGeneration;
+    private static long lastRefreshRequest;
+    public static void requestRefresh(String reason) {
+        synchronized (REFRESH) {
+            long now = System.currentTimeMillis();
+            if (now - lastRefreshRequest < 1500) return;
+            lastRefreshRequest = now;
+            refreshGeneration++;
+            REFRESH.notifyAll();
+        }
+        ModuleLog.log(TAG + ": 请求刷新 " + reason);
+    }
+
+    private static void waitForRefresh(long delay, long generation) {
+        synchronized (REFRESH) {
+            if (refreshGeneration != generation) return;
+            try { REFRESH.wait(delay); } catch (InterruptedException ignored) {}
+        }
+    }
+
+    private static void installRefreshHooks() {
+        HookRuntime.hookMethod(android.app.Instrumentation.class, "callActivityOnResume",
+                new Class<?>[]{android.app.Activity.class}, "resign.refresh.activity", new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                try {
+                    android.app.Activity activity = (android.app.Activity) chain.getArg(0);
+                    String name = activity.getClass().getName().toLowerCase(java.util.Locale.ROOT);
+                    if (name.contains("contact") || name.contains("department") || name.contains("organization"))
+                        requestRefresh("进入通讯录 " + activity.getClass().getSimpleName());
+                } catch (Throwable ignored) {}
+                return chain.proceed();
+            }
+        });
+        HookRuntime.hookMethod(android.widget.TextView.class, "setText",
+                new Class<?>[]{CharSequence.class, android.widget.TextView.BufferType.class},
+                "resign.refresh.breadcrumb", new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                try {
+                    Object text = chain.getArg(0);
+                    if (text == null) return result;
+                    String title = text.toString().trim();
+                    android.widget.TextView v = (android.widget.TextView) chain.getThisObject();
+                    String id = "";
+                    try { id = v.getResources().getResourceEntryName(v.getId()); } catch (Throwable ignored) {}
+                    if ("breadcrumb_label_tv".equals(id) || title.equals("组织架构")
+                            || title.equals("组织内联系人") || title.equals("组织结构")) requestRefresh("组织架构加载");
+                } catch (Throwable ignored) {}
+                return result;
+            }
+        });
+    }
 
     public static native boolean nativeInit();
     public static native int nativeArmDump(String path);   // 请求一次 dump(下次 contact.db prepare 时就地完成)
@@ -65,6 +122,7 @@ public class ResignTracker {
         if (!PKG.equals(currentProcessName())) return;
 
         if (STARTED) return; STARTED = true;
+        try { installRefreshHooks(); } catch (Throwable t) { ModuleLog.log(TAG + ": refresh hook err " + t); }
         // 起后台线程: 先等 Application context 就绪, 再抽 so + 装 hook + 周期 dump
         Thread boot = new Thread(new Runnable() {
             @Override public void run() {
@@ -126,10 +184,14 @@ public class ResignTracker {
                 int idx = 0;
                 int profTick = 0;
                 int rosterTick = 0;
+                long processedGeneration = -1;
                 while (true) {
+                    final long generation = refreshGeneration;
+                    boolean requested = generation != processedGeneration;
+                    processedGeneration = generation;
                     try {
                         Config.load();
-                        if (!Config.resign) { sleep(30000); continue; }
+                        if (!Config.resign) { waitForRefresh(30000, generation); continue; }
 
                         // 1) 探测当前登录账号 → 输出目录 files/accounts/<uid>/resign_tracker
                         String uid = com.chekayo.feishuantirecall.AccountPaths.detectUid(appCtx);
@@ -149,10 +211,14 @@ public class ResignTracker {
                         File accProf = new File(outDir, "profiles.json");
                         File accRosterJl = new File(outDir, "roster.jsonl");
 
+                        boolean dumpProfiles = requested || profTick++ % 3 == 0;
+                        boolean dumpRoster = requested || rosterTick++ % 5 == 0;
+                        if (dumpProfiles) nativeArmProfiles(accProfJl.getAbsolutePath());
+                        if (dumpRoster) nativeArmRoster(accRosterJl.getAbsolutePath());
                         // 2) 离职快照
                         nativeArmDump(accSnap.getAbsolutePath());
                         int rc = -999;
-                        for (int k = 0; k < 60; k++) {
+                        for (int k = 0; k < 60 && refreshGeneration == generation; k++) {
                             rc = nativePoll();
                             if (rc >= 0) break;
                             sleep(500);
@@ -167,11 +233,10 @@ public class ResignTracker {
                         }
 
                         // 3) V3 富资料 → 当前账号 profiles.json
-                        if (profTick++ % 3 == 0) {
+                        if (dumpProfiles) {
                             try {
-                                nativeArmProfiles(accProfJl.getAbsolutePath());
                                 int prc = -999;
-                                for (int k = 0; k < 60; k++) { prc = nativeProfileResult(); if (prc >= 0) break; sleep(500); }
+                                for (int k = 0; k < 60 && refreshGeneration == generation; k++) { prc = nativeProfileResult(); if (prc >= 0) break; sleep(500); }
                                 if (prc >= 0) {
                                     int n = ProfileBulk.merge(accProfJl, accProf);
                                     com.chekayo.feishuantirecall.ModuleLog.log(TAG + ": V3富资料 dump=" + prc + " 并入=" + n + " -> " + accProf.getAbsolutePath());
@@ -182,11 +247,10 @@ public class ResignTracker {
                         }
 
                         // 4) 全量花名册 → 当前账号 profiles.json
-                        if (rosterTick++ % 5 == 0) {
+                        if (dumpRoster) {
                             try {
-                                nativeArmRoster(accRosterJl.getAbsolutePath());
                                 int rrc = -999;
-                                for (int k = 0; k < 60; k++) { rrc = nativeRosterResult(); if (rrc >= 0) break; sleep(500); }
+                                for (int k = 0; k < 60 && refreshGeneration == generation; k++) { rrc = nativeRosterResult(); if (rrc >= 0) break; sleep(500); }
                                 if (rrc >= 0) {
                                     int n = ProfileBulk.mergeRoster(accRosterJl, accProf);
                                     com.chekayo.feishuantirecall.ModuleLog.log(TAG + ": 全量花名册 dump=" + rrc + " 并入=" + n
@@ -197,7 +261,7 @@ public class ResignTracker {
                             } catch (Throwable re) { com.chekayo.feishuantirecall.ModuleLog.log(TAG + ": roster dump err " + re); }
                         }
                     } catch (Throwable e) { com.chekayo.feishuantirecall.ModuleLog.log(TAG + ": dump err " + e); }
-                    sleep(delays[Math.min(idx++, delays.length - 1)]);
+                    waitForRefresh(requested ? 1500 : delays[Math.min(idx++, delays.length - 1)], generation);
                 }
             }
         }, "lark-resign-tracker");
@@ -269,8 +333,10 @@ public class ResignTracker {
         is.close(); return new String(b, 0, off, "UTF-8");
     }
     static void writeText(File f, String s) throws Exception {
-        FileOutputStream os = new FileOutputStream(f);
-        os.write(s.getBytes("UTF-8")); os.flush(); os.close();
+        File tmp = new File(f.getParentFile(), f.getName() + ".tmp");
+        FileOutputStream os = new FileOutputStream(tmp);
+        try { os.write(s.getBytes("UTF-8")); os.flush(); } finally { os.close(); }
+        if (!tmp.renameTo(f)) throw new java.io.IOException("档案写入失败 " + f);
         f.setReadable(true, false);
     }
 

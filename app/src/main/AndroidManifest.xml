@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.chekayo.feishuantirecall"
-    android:versionCode="1033"
-    android:versionName="1.8.11-api102">
+    android:versionCode="1034"
+    android:versionName="1.8.12-api102">
 
     <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+
+    <queries>
+        <package android:name="com.chekayo.feishuantirecall" />
+        <package android:name="com.ss.android.lark" />
+        <package android:name="com.larksuite.suite" />
+    </queries>
 
     <application
         android:allowBackup="false"
@@ -37,6 +43,8 @@
             android:authorities="com.chekayo.feishuantirecall.config"
             android:exported="true"
             android:grantUriPermissions="false" />
+
+        <receiver android:name=".BlockLog$Receiver" android:exported="true" />
 
         <!-- 同事档案/离职名单副本接收：飞书侧 ArchiveSync 显式包名广播（兼容 Android 11+ 包可见性） -->
         <receiver

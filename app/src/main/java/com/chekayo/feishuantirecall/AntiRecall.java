@@ -52,14 +52,16 @@ public class AntiRecall {
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.8.11-api102";
-    static final int MODULE_VERSION_CODE = 1033;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
+    static final String MODULE_VERSION = "1.8.12-api102";
+    static final int MODULE_VERSION_CODE = 1034;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
     static final String MAPPER = "ax2.b";
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
     static final String EXPECTED_SIG = "0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd";
     // 0=未判定, 1=正版, 2=被篡改(重签名)。篡改则禁用核心功能(防撤回/防已读) + 面板告警。
     static volatile int TAMPER = 0;
+    // APK 归档解析在部分 ROM 上较慢或会抛错；每进程只检查一次，错误仍按旧规则放行。
+    private static volatile int SIGNATURE_STATE = 0; // 0=未检查，1=可信/读取失败放行，2=证书不匹配
     static final String STATUS = "com.ss.android.lark.chat.entity.message.Message$Status";
 
 
@@ -77,6 +79,7 @@ public class AntiRecall {
 
     /** JNI: FeishuKit 设置面板实时开关防撤回中和. */
     public static native void nativeSetRecall(boolean on);
+    /** JNI: 0=原生撤回提示，1=保留他人原文并用气泡颜色标识。 */
 
     /** JNI: 读取已提交的撤回标记快照，不从 UI 线程访问飞书数据库连接。 */
     public static native boolean nativeIsRecallMarked(String uid, long chat, long id);
@@ -147,10 +150,13 @@ public class AntiRecall {
                         RecallBubbleUi.schedule();
                         try {
                             nativeSetRecall(Config.antirecall);
+
                             nativeSetKeepKicked(Config.keepkicked);
                             nativeSetDiag(Config.diaglog);
                             nativeSetLeaveNotify(Config.leavenotify);
                         } catch (Throwable ignored) {}
+                    } else if (ArchiveSync.ACTION_REFRESH.equals(act)) {
+                        com.chekayo.larkresign.ResignTracker.requestRefresh("桌面刷新请求");
                     } else if (ArchiveSync.ACTION_PULL.equals(act)) {
                         // 桌面入口请求档案副本 → 推 profiles + 离职名单
                         ArchiveSync.pushAll();
@@ -160,6 +166,7 @@ public class AntiRecall {
             android.content.IntentFilter syncFilter = new android.content.IntentFilter();
             syncFilter.addAction(Config.ACTION_SYNC);
             syncFilter.addAction(ArchiveSync.ACTION_PULL);
+            syncFilter.addAction(ArchiveSync.ACTION_REFRESH);
             // 必须 EXPORTED：发送方是模块桌面进程（另一 UID），NOT_EXPORTED 会收不到
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 c.registerReceiver(receiver, syncFilter, android.content.Context.RECEIVER_EXPORTED);
@@ -171,7 +178,7 @@ public class AntiRecall {
             HotReloadSafety.markExternalCallback("config-bridge.receiver(sync,pull)");
             ModuleLog.log("[fucklark] config bridge bound pkg=" + c.getPackageName());
             // Context 就绪后再与模块权威源对齐一次（install 分发早期可能 context 还是 null）
-            try { Config.loadAndAnnounce(); } catch (Throwable ignored) {}
+            try { Config.loadAndAnnounce(); Config.startPolling(); } catch (Throwable ignored) {}
         } catch (Throwable t) {
             ModuleLog.log("[fucklark] config bridge bind failed: " + t);
         }
@@ -191,6 +198,7 @@ public class AntiRecall {
         // 救"后台被撤回"的消息: 撤回后服务器只下发已撤回空壳, 但原文到过设备(弹过通知), 在这里抓下来。
         try {
             File fdir = larkFilesDir();
+            Diag.setFilesDir(fdir);
             Config.setFilesDir(fdir);        // 每进程都设: 让 Config.notifarchive 能从磁盘读到
             AccountPaths.currentPkg = PKG;   // 供 NotifArchive/AccountPaths 无 Context 探测 uid 用
             NotifArchive.setFilesDir(fdir);
@@ -203,6 +211,11 @@ public class AntiRecall {
 
         // ---- 0.55) 屏蔽输入框上方「消息速览」AI 总结小提示 ----
         try { AiPeekBlock.install(); } catch (Throwable t) { ModuleLog.log("[fucklark] ai peek init failed: " + t); }
+
+        try { MessageTimeDisplay.install(classLoader); } catch (Throwable t) { ModuleLog.log("[fucklark] message time init failed: " + t); }
+
+        // ---- 0.56) 屏蔽消息中的「相关知识」AI 推荐卡片 ----
+        try { RelatedKnowledgeBlock.install(); } catch (Throwable t) { ModuleLog.log("[fucklark] related knowledge init failed: " + t); }
 
         // ---- 0.6) 解除文件/图片下载限制: 加密聊天禁另存 -> 强制放行(按签名定位, 抗混淆) ----
         try { FileDownloadUnlock.install(classLoader); } catch (Throwable t) { ModuleLog.log("[fucklark] download unlock init failed: " + t); }
@@ -218,7 +231,7 @@ public class AntiRecall {
             if (PKG.equals(currentProcessName())) installDownloadMirror();
         } catch (Throwable t) { ModuleLog.log("[fucklark] download mirror init failed: " + t); }
 
-        // ---- 1) Independent recall layers, main process only ----
+        // ---- 1) 防撤回三层独立安装：身份/Java 兜底、native SQL 拦截、原气泡标识 ----
         if (PKG.equals(currentProcessName())) installRecall(classLoader, new RecallInitStep() {
             public void run() throws Throwable { startNative(); }
         });
@@ -270,19 +283,27 @@ public class AntiRecall {
      * 直接读 MODULE_PATH 的 APK 归档签名(与包名无关, 重命名也拦得到)。
      * 判定原则: 只有【确认证书不同】才判篡改; 读不到/出错一律放行(fail-open), 不误伤正版。
      */
-    static boolean checkSignature(android.content.Context ctx) {
+    static synchronized boolean checkSignature(android.content.Context ctx) {
+        if (SIGNATURE_STATE == 1) return true;
+        if (SIGNATURE_STATE == 2) return false;
+        if (MODULE_PATH == null || ctx == null) return true;
         try {
-            if (MODULE_PATH == null || ctx == null) return true;
             android.content.pm.PackageManager pm = ctx.getPackageManager();
             android.content.pm.PackageInfo pi = pm.getPackageArchiveInfo(
                     MODULE_PATH, android.content.pm.PackageManager.GET_SIGNATURES);
-            if (pi == null || pi.signatures == null || pi.signatures.length == 0) return true;
+            if (pi == null || pi.signatures == null || pi.signatures.length == 0) {
+                SIGNATURE_STATE = 1;
+                return true;
+            }
             java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
             byte[] d = md.digest(pi.signatures[0].toByteArray());
             StringBuilder sb = new StringBuilder();
             for (byte b : d) sb.append(String.format("%02x", b));
-            return EXPECTED_SIG.equals(sb.toString());
+            boolean trusted = EXPECTED_SIG.equals(sb.toString());
+            SIGNATURE_STATE = trusted ? 1 : 2;
+            return trusted;
         } catch (Throwable t) {
+            SIGNATURE_STATE = 1;
             return true;   // 校验异常放行, 避免个别机型/系统误伤正版
         }
     }
@@ -331,13 +352,7 @@ public class AntiRecall {
                 if (f != null) return f;
             }
         } catch (Throwable ignored) {}
-        File dataDir = null;
-        for (String d : new String[]{"/data/data/" + PKG, "/data/user/0/" + PKG}) {
-            File f = new File(d);
-            if (f.isDirectory()) { dataDir = f; break; }
-        }
-        if (dataDir == null) dataDir = new File("/data/data/" + PKG);
-        return new File(dataDir, "files");
+        return ProfilePaths.filesDir(PKG);
     }
 
     /** hook NotificationManager.notify(String,int,Notification): 抓消息通知正文存档(后台防撤回场景 B)。
@@ -364,10 +379,8 @@ public class AntiRecall {
 
     /**
      * 后台撤回 UI 策略（三分，互不混用）：
-     * 1) 统计存档：由 NotifArchive.capture 写 notif_archive.txt + 还原表（发送人严格匹配）；
-     * 2) 聊天还原：仅当【能对上发送人】且存档有该条原文时，把系统提示整段替换为原文；
-     * 3) 撤回提示：还原失败/无存档时，提示文案只用 Config.recallHintText（默认「撤回了一条消息」），
-     *    绝不把存档里最近一条消息当成提示文案。
+     * 撤回提示只负责文案展示；原文保留由账号、会话和消息 ID 精确匹配。
+     * 通知存档只用于统计，不能按发送人替换历史消息，防止多条消息串文。
      */
     static final java.util.Set<android.widget.TextView> RECALL_UI_BUSY =
             java.util.Collections.synchronizedSet(
@@ -388,29 +401,17 @@ public class AntiRecall {
                         if (src == null) return result;
                         String s = src.toString();
                         if (s == null || s.length() == 0) return result;
-                        if (!Config.antirecall || !isRecallSystemText(s) || isOwnRecallNotice(s)) return result;
+                        if (!Config.antirecall || Config.recallDisplayMode != Config.RECALL_MODE_HINT
+                                || !isRecallSystemText(s) || isOwnRecallNotice(s)) return result;
 
                         android.widget.TextView tv = (android.widget.TextView) chain.getThisObject();
                         if (RECALL_UI_BUSY.contains(tv)) return result;
                         try { Config.load(); } catch (Throwable ignored) {}
 
                         String sender = recallSenderFromUi(s);
-                        // 严格匹配：发送人空或对不上 → 不还原，避免用存档里最新一条乱顶
-                        String orig = null;
-                        if (sender != null && sender.trim().length() > 0) {
-                            orig = NotifArchive.findRestore(sender.trim());
-                        }
-
                         RECALL_UI_BUSY.add(tv);
                         try {
-                            // ── 路径 A：统计里能对上的存档 → 聊天直接还原为原文 ──
-                            if (orig != null && orig.trim().length() > 0 && !orig.trim().equals(s)) {
-                                tv.setVisibility(android.view.View.VISIBLE);
-                                fixRecallRowHeight(tv);
-                                tv.setText(orig.trim());
-                                return result;
-                            }
-                            // ── 路径 B：无存档 → 撤回提示只用配置文案，不用存档内容 ──
+                            // 只改提示文字，禁止用发送人索引覆盖不同消息的内容。
                             if (!Config.showRecallHint) {
                                 tv.setVisibility(android.view.View.GONE);
                                 tv.setHeight(0);
@@ -539,42 +540,43 @@ public class AntiRecall {
         // Identity must be ready for the legacy Mapper even if extraction/dlopen
         // fails. Installing the reader does not call Passport before onCreate.
         try { RecallMessages.install(cl); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall message hook unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall message hook unavailable: " + t); ModuleLog.log("[fucklark] recall message hook unavailable: " + t); }
         try { nativeStart.run(); }
-        catch (Throwable t) { ModuleLog.log("[antirecall] native start failed: " + t); }
+        catch (Throwable t) { Diag.once("[antirecall] native start failed: " + t); ModuleLog.log("[antirecall] native start failed: " + t); }
         try { RecallBubbleUi.install(cl); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall bubble hook unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall bubble hook unavailable: " + t); ModuleLog.log("[fucklark] recall bubble hook unavailable: " + t); }
         RecallActionGuard.install(cl);
         try { RecallTranslationUi.install(cl); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall translation hook unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall translation hook unavailable: " + t); ModuleLog.log("[fucklark] recall translation hook unavailable: " + t); }
     }
 
     static synchronized void startNative() throws Exception {
         if (NATIVE_STARTED) return;
         if (MODULE_PATH == null) throw new IllegalStateException("module path null (ModulePath not applied)");
 
-        File dataDir = null;
-        for (String d : new String[]{"/data/data/" + PKG, "/data/user/0/" + PKG}) {
-            File f = new File(d);
-            if (f.isDirectory()) { dataDir = f; break; }
-        }
-        if (dataDir == null) dataDir = new File("/data/data/" + PKG);
+        File dataDir = ProfilePaths.dataDir(PKG);
         File outDir = new File(dataDir, "antirecall");
         outDir.mkdirs();
-        File out = new File(outDir, "libantirecall.so");
-
         ZipFile zf = new ZipFile(MODULE_PATH);
+        ZipEntry library = zf.getEntry("lib/arm64-v8a/libantirecall.so");
+        if (library == null) { zf.close(); throw new IllegalStateException("native library missing"); }
+        // CRC 随库内容变化，即使版本号相同也不会继续加载旧库文件。
+        File out = new File(outDir, "libantirecall-" + Long.toHexString(library.getCrc()) + ".so");
         try {
             ZipEntry e = zf.getEntry("lib/arm64-v8a/libantirecall.so");
             if (e == null) throw new IllegalStateException("lib/arm64-v8a/libantirecall.so not in module apk");
             InputStream is = zf.getInputStream(e);
-            FileOutputStream os = new FileOutputStream(out);
+            File tmp = new File(outDir, "libantirecall.so.tmp");
+            FileOutputStream os = new FileOutputStream(tmp);
             byte[] buf = new byte[65536];
             int r;
             while ((r = is.read(buf)) > 0) os.write(buf, 0, r);
             os.flush();
+            os.getFD().sync();
             os.close();
             is.close();
+            if (out.exists() && !out.delete()) throw new IllegalStateException("cannot replace old native library");
+            if (!tmp.renameTo(out)) throw new IllegalStateException("cannot publish native library");
         } finally {
             zf.close();
         }
@@ -611,7 +613,8 @@ public class AntiRecall {
         // 注意: 不能只 load() 本地旧文件——会把刚同步到的配置冲掉
         try {
             Config.loadAndAnnounce();
-            nativeSetRecall(Config.antirecall); nativeSetDiag(Config.diaglog);
+            nativeSetRecall(Config.antirecall);
+            nativeSetDiag(Config.diaglog);
             nativeSetKeepKicked(Config.keepkicked); nativeSetLeaveNotify(Config.leavenotify);
             ModuleLog.log("[fucklark] antirecall=" + Config.antirecall + " resign=" + Config.resign
                     + " antiread=" + Config.antiread + " diaglog=" + Config.diaglog
@@ -681,8 +684,8 @@ public class AntiRecall {
                 try {
                     RecallMessages.refreshAccount();
                     if (installNativeHooks()) {
-                        ModuleLog.log("[antirecall] native hook installed (after " + i + " tries)");
-                        Diag.w("防撤回: sqlite3_step hook 已安装 (第 " + i + " 次尝试命中 libsqlcipher) ✓");
+                        ModuleLog.log("[antirecall] SQLite hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次");
+                        Diag.w("防撤回: sqlite3_step hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次；等待实际撤回 SQL 命中");
                         // 安装成功后转入维护循环: 周期重打被反篡改还原的 liblark hook + 轮询退群提醒.
                         android.os.Handler mh = new android.os.Handler(android.os.Looper.getMainLooper());
                         while (true) {

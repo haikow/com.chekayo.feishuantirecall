@@ -20,7 +20,7 @@ public class ConfigProvider extends ContentProvider {
 
     @Override public boolean onCreate() { return true; }
 
-    @Override public Bundle call(String method, String arg, Bundle extras) {
+    @Override public synchronized Bundle call(String method, String arg, Bundle extras) {
         try {
             if (getContext() != null) {
                 Config.setContext(getContext());
@@ -28,13 +28,33 @@ public class ConfigProvider extends ContentProvider {
             }
             if ("get".equals(method)) {
                 Config.load();
+                RuntimeStatus.report(extras);
                 Bundle b = new Bundle();
                 b.putString("json", Config.snapshot());
+                return b;
+            }
+            if ("status".equals(method)) {
+                Config.load();
+                Bundle b = new Bundle();
+                b.putString("text", RuntimeStatus.describe());
+                return b;
+            }
+            if ("blockLogAdd".equals(method)) {
+                if (extras != null) BlockLog.appendLocal(getContext(), extras.getString("json"));
+                Bundle b = new Bundle(); b.putBoolean("ok", true); return b;
+            }
+            if ("blockLogGet".equals(method)) {
+                Bundle b = new Bundle(); b.putString("text", BlockLog.readLocal(getContext())); return b;
+            }
+            if ("patch".equals(method)) {
+                Bundle b = new Bundle();
+                b.putString("json", Config.applyPatch(extras != null && extras.getString("json") != null ? extras.getString("json") : arg));
                 return b;
             }
             if ("put".equals(method)) {
                 String json = extras != null ? extras.getString("json") : null;
                 Config.onSyncReceive(json);
+                Config.broadcast();
                 Bundle b = new Bundle();
                 b.putString("json", Config.snapshot());
                 return b;
@@ -54,15 +74,13 @@ public class ConfigProvider extends ContentProvider {
                     if (!dir.isDirectory()) dir.mkdirs();
                     out = new File(dir, name);
                 }
-                FileOutputStream os = new FileOutputStream(out);
-                os.write(data);
-                os.close();
+                Config.write(out, new String(data, "UTF-8"));
                 out.setReadable(true, false);
                 Bundle b = new Bundle();
                 b.putBoolean("ok", true);
                 return b;
             }
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) { android.util.Log.w("fucklark", "配置源调用失败 method=" + method, t); }
         return null;
     }
 

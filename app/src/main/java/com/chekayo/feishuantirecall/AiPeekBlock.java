@@ -63,6 +63,7 @@ public final class AiPeekBlock {
                             View child = (View) args[0];
                             // 只拦确认是速览节点本身（含 peek 类名/文案）；shell 隐藏由 setText→hideTipShell 负责
                             if (isPeekNode(child)) {
+                                BlockLog.record("消息速览", child, "挂载拦截");
                                 markBlocked(child);
                                 hit("addView", "拦下浮层 class=" + child.getClass().getName());
                                 block = true;
@@ -134,6 +135,7 @@ public final class AiPeekBlock {
                             String brief = s.trim();
                             if (brief.length() > 24) brief = brief.substring(0, 24);
                             hit("setText", "文案=" + brief + " class=" + tv.getClass().getName());
+                            BlockLog.record("消息速览", tv, "文案拦截", s);
                             hideTipShell(tv);
                         } finally {
                             BUSY.remove(tv);
@@ -160,7 +162,11 @@ public final class AiPeekBlock {
     /** 文案锚点：以「消息速览」开头。不含「屏蔽消息速览」「显示 AI 速览」「N 条新消息」。 */
     static boolean isPeekText(String s) {
         if (s == null || s.length() == 0) return false;
-        return s.trim().startsWith("消息速览");
+        String text = s.trim();
+        if (!text.startsWith("消息速览")) return false;
+        if (text.length() == 4) return true;
+        char boundary = text.charAt(4);
+        return boundary == ':' || boundary == '：' || Character.isWhitespace(boundary);
     }
 
     /**

@@ -4,14 +4,15 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-import io.github.libxposed.api.XposedInterface;
 
-/** Message identity/ownership and the bounded foreground-content fallback. */
+/** 按账号/会话/消息识别撤回，并在前台限量缓存原文作为 Java 层兜底。 */
 final class RecallMessages {
     interface AccountReader { String read() throws Throwable; }
     static AccountReader accountReader;
     static volatile boolean applicationReady;
     static RecallMarkStore markerStore;
+    private static volatile String hookStatus = "未安装";
+    static String status() { return hookStatus; }
     private static synchronized RecallMarkStore markers() {
         if (markerStore == null) markerStore = new RecallMarkStore(new java.io.File(AntiRecall.larkFilesDir(), "recall_marks"));
         return markerStore;
@@ -42,6 +43,7 @@ final class RecallMessages {
         Entry(Object content) { this.content = content; }
     }
 
+    /** 宿主 Application 就绪后才查询账号；原文只在可见气泡绑定时采集。 */
     static void install(ClassLoader cl) throws Throwable {
         final Class<?> passport = cl.loadClass("com.ss.android.lark.passport_api.IPassportApi");
         final Method getApi = cl.loadClass("com.ss.android.lark.utils.ApiUtils").getMethod("getApi", Class.class);
@@ -54,21 +56,10 @@ final class RecallMessages {
                 return api == null ? "" : (String) getUid.invoke(api);
             }
         };
-        // Storage initialization must not disable the legacy identity fallback.
+        // 标记目录故障不能阻止气泡层或 native 层继续工作。
         try { markers(); } catch (Throwable ignored) {}
-        Class<?> info = cl.loadClass("com.ss.android.lark.chat.entity.message.MessageInfo");
-        Class<?> message = cl.loadClass("com.ss.android.lark.chat.entity.message.Message");
-        for (Method method : info.getDeclaredMethods()) {
-            if (!method.getName().equals("getMessage") || method.getParameterTypes().length != 0
-                    || method.getReturnType() != message || method.isBridge()) continue;
-            HookRuntime.hook(method, "recall.messageInfo", new XposedInterface.Hooker() {
-                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                    Object result = chain.proceed();
-                    prepare(result);
-                    return result;
-                }
-            });
-        }
+        hookStatus = "消息身份读取器已安装";
+        Diag.once("[fucklark] 防撤回锚点命中: " + hookStatus);
     }
 
     static long positive(String s) {
@@ -119,7 +110,7 @@ final class RecallMessages {
             }
             AntiRecall.nativeBindRecallAccount(uid, storage);
             boundAccounts.add(uid);
-            ModuleLog.log("[fucklark] recall account: verified SDK storage mapping");
+            Diag.once("[fucklark] recall account: verified SDK storage mapping");
         } catch (Throwable ignored) {}
     }
     static String value(Object object, String getter) throws Throwable {
@@ -129,6 +120,7 @@ final class RecallMessages {
     static String key(String uid, String chat, String id) {
         return positive(uid) > 0 && positive(chat) > 0 && positive(id) > 0 ? uid + ":" + chat + ":" + id : null;
     }
+    /** 优先查内存/持久化索引，最后查询 native 已提交快照，不从 UI 线程碰数据库。 */
     static boolean marked(String uid, String chat, String id) {
         String key = key(uid, chat, id);
         if (key == null) return false;
@@ -157,8 +149,10 @@ final class RecallMessages {
         catch (Throwable ignored) { return false; }
     }
 
+    /** 只恢复身份明确、非自己的撤回消息；身份不一致时放行宿主原行为。 */
     static void prepare(Object message) {
-        if (message == null || !Config.antirecall || AntiRecall.TAMPER == 2) return;
+        if (message == null || !Config.antirecall
+                || AntiRecall.TAMPER == 2) return;
         try {
             String uid = account(), chat = value(message, "getChatId"), id = value(message, "getId");
             String key = key(uid, chat, id);
@@ -192,6 +186,8 @@ final class RecallMessages {
             Reflect.callMethod(message, "setStatus", normal);
             synchronized (contents) { entry.recalled = true; }
             remember(uid, chat, id);
-        } catch (Throwable ignored) { /* Host models vary; leave the original untouched. */ }
+        } catch (Throwable t) {
+            Diag.once("[fucklark] 防撤回消息模型锚点失败: " + t.getClass().getSimpleName());
+        }
     }
 }

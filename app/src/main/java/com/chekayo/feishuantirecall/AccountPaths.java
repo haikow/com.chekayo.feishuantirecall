@@ -43,8 +43,7 @@ public final class AccountPaths {
             File data = null;
             if (ctx != null) data = ctx.getFilesDir().getParentFile();
             if (data == null) {
-                data = new File("/data/data/" + currentPkg);
-                if (!data.isDirectory()) data = new File("/data/user/0/" + currentPkg);
+                data = ProfilePaths.dataDir(currentPkg);
             }
             File sdk = new File(data, "databases/sdk_storage");
             File[] subs = sdk.listFiles();
@@ -82,8 +81,7 @@ public final class AccountPaths {
         File base = ctx != null ? ctx.getFilesDir() : null;
         if (base == null) {
             String p = (pkg == null || pkg.isEmpty()) ? currentPkg : pkg;
-            base = new File("/data/data/" + p + "/files");
-            if (!base.isDirectory()) base = new File("/data/user/0/" + p + "/files");
+            base = ProfilePaths.filesDir(p);
         }
         return new File(base, "accounts/" + safeUid(uid));
     }
@@ -118,9 +116,7 @@ public final class AccountPaths {
         // 旧全局
         for (String p : pkgs) {
             if (p == null || p.isEmpty()) continue;
-            File f = new File("/data/data/" + p + "/files/resign_tracker/" + name);
-            if (f.exists()) return f;
-            f = new File("/data/user/0/" + p + "/files/resign_tracker/" + name);
+            File f = new File(ProfilePaths.filesDir(p), "resign_tracker/" + name);
             if (f.exists()) return f;
         }
         try {
@@ -130,7 +126,7 @@ public final class AccountPaths {
                 return accountFile((Context) app, pkg, uid, "resign_tracker/" + name);
             }
         } catch (Throwable ignored) { }
-        return new File("/data/data/" + (pkg == null ? currentPkg : pkg) + "/files/resign_tracker/" + name);
+        return new File(ProfilePaths.filesDir(pkg == null ? currentPkg : pkg), "resign_tracker/" + name);
     }
 
     /**
@@ -265,9 +261,7 @@ public final class AccountPaths {
         }
         for (String p : pkgs) {
             if (p == null || p.isEmpty()) continue;
-            File f = new File("/data/data/" + p + "/files/" + fileName);
-            if (f.exists()) return f;
-            f = new File("/data/user/0/" + p + "/files/" + fileName);
+            File f = new File(ProfilePaths.filesDir(p), fileName);
             if (f.exists()) return f;
         }
         String p = pkg == null ? currentPkg : pkg;

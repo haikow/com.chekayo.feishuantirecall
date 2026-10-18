@@ -142,7 +142,11 @@ static void recall_trace(const char *stage) {
     static std::mutex mutex;
     static std::set<std::string> seen;
     std::lock_guard<std::mutex> guard(mutex);
-    if (seen.size() < 32 && seen.insert(stage).second) LOGI("RECALL-STATE: %s", stage);
+    if (!g_diag_log) return;
+    if (seen.size() < 32 && seen.insert(stage).second) {
+        LOGI("RECALL-STATE: %s", stage);
+        flog("防撤回锚点状态: %s", stage);
+    }
 }
 static recall::Api recall_api(SqlProv *p) {
     return {p->orig_step, p->prepare, p->finalize, p->col_i64, p->db_filename, p->autocommit, p->error, recall_trace,
@@ -1819,6 +1823,7 @@ static bool try_prov(SqlProv *p) {
          (void *) p->sql, (void *) p->exp, (void *) p->bind64);
     if (!step || !p->sql || !p->exp || !p->free_fn || !p->bind64) {
         LOGE("%s resolve failed (sym missing), give up this provider", p->so);
+        flog("防撤回扫描: provider=%s 符号缺失，跳过该库", p->so);
         p->gave_up = true;
         return false;
     }
@@ -1828,6 +1833,7 @@ static bool try_prov(SqlProv *p) {
     memcpy(p->hookbytes, step, 16);   // 记录 hook 后的入口字节, 供 maintain 检测被还原
     p->installed = true;
     LOGI("ANTI-RECALL native hook installed on %s sqlite3_step @%p", p->so, step);
+    flog("防撤回扫描: provider=%s sqlite3_step 锚点命中并已安装", p->so);
     return true;
 }
 
@@ -1836,10 +1842,10 @@ Java_com_chekayo_feishuantirecall_AntiRecall_tryInstall(JNIEnv *, jclass) {
     install_probe();   // 防已读调研探针 (与 sqlcipher 防撤回 hook 互不影响)
 
     // 任一 provider 挂上 + 探针就绪即完成; 迟加载的 provider 由 maintain_hook 周期补装。
-    if (g_installed) return g_probe_installed ? JNI_TRUE : JNI_FALSE;
+    if (g_installed) return JNI_TRUE;
     bool any = false;
     for (SqlProv &p : g_prov) if (try_prov(&p)) any = true;
     if (!any) return JNI_FALSE;               // 一个库都还没就绪, 继续重试
     g_installed = true;
-    return g_probe_installed ? JNI_TRUE : JNI_FALSE;
+    return JNI_TRUE;
 }

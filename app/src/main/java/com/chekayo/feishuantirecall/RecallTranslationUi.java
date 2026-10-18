@@ -14,7 +14,7 @@ import java.util.WeakHashMap;
 
 import io.github.libxposed.api.XposedInterface;
 
-/** A retained message must not keep the host's translation request UI alive. */
+/** 撤回后停止翻译动画并移除入口，兼顾普通聊天与话题回复页。 */
 final class RecallTranslationUi {
     private static final String BLOCK = "com.ss.android.lark.chat.chatwindow.biz.component.messagelist.render.block.MessageTranslateBlock";
     private static final Map<View, Binding> bindings = new WeakHashMap<View, Binding>();
@@ -34,13 +34,13 @@ final class RecallTranslationUi {
         stopAnimation = stop;
         HookRuntime.hook(start, "recall.translation.start", new StartHook());
         try { installChat(cl, animation); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall chat translation unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall chat translation unavailable: " + t); }
         try { installThread(cl, animation); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall thread translation unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall thread translation unavailable: " + t); }
         try { installDialogGuard(cl); }
-        catch (Throwable t) { ModuleLog.log("[fucklark] recall translation dialog guard unavailable: " + t); }
+        catch (Throwable t) { Diag.once("[fucklark] recall translation dialog guard unavailable: " + t); }
         HotReloadSafety.markExternalCallback("recall.translation.attach-refresh");
-        ModuleLog.log("[fucklark] recall translation policy: stop loading and disable retained-message entry");
+        Diag.once("[fucklark] recall translation policy: stop loading and disable retained-message entry");
     }
 
     private static void installChat(ClassLoader cl, Class<?> animation) throws Throwable {
@@ -192,8 +192,7 @@ final class RecallTranslationUi {
         return binding;
     }
 
-    // Shares the bubble refresh timer so a SQL-only recall is handled even if
-    // Feishu never rebinds this translation block. No second polling loop.
+    // 与气泡共用刷新定时器：SQL 层撤回即使没触发宿主重绑，也能清除旧翻译控件。
     static boolean refresh(String uid) {
         boolean active = false;
         for (Map.Entry<View, Binding> item : new ArrayList<Map.Entry<View, Binding>>(bindings.entrySet())) {
@@ -231,7 +230,7 @@ final class RecallTranslationUi {
             }
             if (!reportedCleanup) {
                 reportedCleanup = true;
-                ModuleLog.log("[fucklark] recall translation: animation stopped, entry cleared");
+                Diag.once("[fucklark] recall translation: animation stopped, entry cleared");
             }
             return true;
         }

@@ -35,8 +35,8 @@ final class Ui {
         } catch (Throwable t) { return true; }
     }
 
-    static int bg(Context c)        { return isNight(c) ? 0xFF121212 : 0xFFF5F5F7; }
-    static int cardBg(Context c)    { return isNight(c) ? 0xFF1C1C1E : 0xFFFFFFFF; }
+    static int bg(Context c)        { return isNight(c) ? 0xFF101522 : 0xFFF0F4FC; }
+    static int cardBg(Context c)    { return isNight(c) ? 0xE5263042 : 0xEDFFFFFF; }
     static int titleColor(Context c){ return isNight(c) ? 0xFFF2F2F7 : 0xFF111111; }
     static int subColor(Context c)  { return isNight(c) ? 0xFF9AA0A6 : 0xFF6B7280; }
     static int muteColor(Context c) { return isNight(c) ? 0xFF6B7280 : 0xFF9CA3AF; }
@@ -53,7 +53,9 @@ final class Ui {
     static LinearLayout page(Context c) {
         LinearLayout v = new LinearLayout(c);
         v.setOrientation(LinearLayout.VERTICAL);
-        v.setBackgroundColor(bg(c));
+        v.setBackground(new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+                isNight(c) ? new int[]{0xFF172338, 0xFF161B2A, 0xFF211B32}
+                        : new int[]{0xFFE7F0FF, 0xFFF3F5FC, 0xFFF2EAFE}));
         return v;
     }
 
@@ -61,13 +63,62 @@ final class Ui {
     static LinearLayout card(Context c) {
         LinearLayout v = new LinearLayout(c);
         v.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable d = new GradientDrawable();
-        d.setColor(cardBg(c));
-        d.setCornerRadius(dp(c, 12));
+        GradientDrawable d = glass(c, 24, true);
         v.setBackground(d);
+        v.setElevation(dp(c, 3));
+        v.setClipToOutline(true);
         int p = dp(c, 4);
         v.setPadding(p, dp(c, 2), p, dp(c, 2));
         return v;
+    }
+
+    static GradientDrawable glass(Context c, int radius, boolean translucent) {
+        boolean night = isNight(c);
+        int[] colors = translucent
+                ? (night ? new int[]{0xE5323D51, 0xDC202A3A} : new int[]{0xF5FFFFFF, 0xDBF7FAFF})
+                : (night ? new int[]{0xFF293447, 0xFF202939} : new int[]{0xFFFFFFFF, 0xFFF3F7FF});
+        GradientDrawable d = new GradientDrawable(GradientDrawable.Orientation.TL_BR, colors);
+        d.setCornerRadius(dp(c, radius));
+        d.setStroke(dp(c, 1), night ? 0x38FFFFFF : 0xCCFFFFFF);
+        return d;
+    }
+
+    static void styleDialog(final android.app.AlertDialog dialog) {
+        final android.view.Window window = dialog.getWindow();
+        if (window == null) return;
+        final Context c = dialog.getContext();
+        window.setBackgroundDrawable(glass(c, 28, false));
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+        window.setDimAmount(0.24f);
+        if (Build.VERSION.SDK_INT >= 31) {
+            try { Blur31.apply(window, c); }
+            catch (Throwable t) { android.util.Log.w("fucklark", "系统模糊不可用，使用清晰背景", t); }
+        }
+    }
+
+    /** 将新系统 API 放在独立类中，旧安卓仍使用不透明卡片。 */
+    private static class Blur31 {
+        static void apply(final android.view.Window window, final Context c) {
+            final android.view.WindowManager wm = (android.view.WindowManager) c.getSystemService(Context.WINDOW_SERVICE);
+            if (wm == null) return;
+            final java.util.function.Consumer<Boolean> changed = new java.util.function.Consumer<Boolean>() {
+                @Override public void accept(Boolean enabled) {
+                    window.setBackgroundDrawable(glass(c, 28, enabled));
+                    window.setBackgroundBlurRadius(enabled ? dp(c, 28) : 0);
+                    window.setDimAmount(enabled ? 0.16f : 0.28f);
+                }
+            };
+            changed.accept(wm.isCrossWindowBlurEnabled());
+            final View decor = window.getDecorView();
+            wm.addCrossWindowBlurEnabledListener(changed);
+            decor.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+                @Override public void onViewAttachedToWindow(View v) {}
+                @Override public void onViewDetachedFromWindow(View v) {
+                    wm.removeCrossWindowBlurEnabledListener(changed);
+                    v.removeOnAttachStateChangeListener(this);
+                }
+            });
+        }
     }
 
     /** 分组小标题（卡片上方留白）。 */
@@ -111,6 +162,9 @@ final class Ui {
                           final OnToggle cb) {
         LinearLayout row = new LinearLayout(c);
         row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setBackground(new android.graphics.drawable.RippleDrawable(
+                ColorStateList.valueOf(isNight(c) ? 0x223B9EFF : 0x163B9EFF), null, null));
+        row.setMinimumHeight(dp(c, 64));
         row.setGravity(Gravity.CENTER_VERTICAL);
         int px = dp(c, 16), py = dp(c, 12);
         row.setPadding(px, py, px, py);
@@ -151,6 +205,9 @@ final class Ui {
     static View navRow(Context c, String title, String sub, int accent, View.OnClickListener cl) {
         LinearLayout row = new LinearLayout(c);
         row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setBackground(new android.graphics.drawable.RippleDrawable(
+                ColorStateList.valueOf(isNight(c) ? 0x223B9EFF : 0x163B9EFF), null, null));
+        row.setMinimumHeight(dp(c, 64));
         row.setGravity(Gravity.CENTER_VERTICAL);
         int px = dp(c, 16), py = dp(c, 12);
         row.setPadding(px, py, px, py);

@@ -1,7 +1,7 @@
 #pragma once
 
-// Provider-neutral recall policy. All SQL runs on the intercepted connection,
-// through its original sqlite entry points; JNI reads snapshots, never DB handles.
+// 防撤回 SQL 策略同时适配 SQLCipher/WCDB：在宿主原连接上调用原始 SQLite 入口；
+// JNI 只查询已提交的内存快照，绝不把数据库连接交给 UI 线程。
 #include <algorithm>
 #include <cctype>
 #include <climits>
@@ -59,6 +59,7 @@ inline void bindOwner(const std::string &storage, const std::string &uid) {
     std::lock_guard<std::mutex> guard(o.mutex);
     o.ids[storage] = uid;
 }
+// SDK 库目录可能是账号哈希；只有已验证绑定的目录才映射为账号，未知目录不猜测。
 inline std::string owner(const std::string &path) {
     const std::string prefix = "/sdk_storage/";
     size_t p = path.find(prefix);
@@ -73,8 +74,7 @@ inline std::string owner(const std::string &path) {
     auto it = o.ids.find(uid);
     return it == o.ids.end() ? "" : it->second;
 }
-// Small lexer, not substring matching: quoted content/comments cannot be mistaken
-// for an is_recalled assignment or a WHERE/VALUES keyword.
+// 用词法扫描判断撤回语句，避免消息正文/注释里的 is_recalled 被误认成 SQL 赋值。
 inline std::vector<Token> lex(const std::string &sql) {
     std::vector<Token> out;
     size_t p = 0;
@@ -230,6 +230,7 @@ public:
         }
         return false;
     }
+    // 仅在没有未提交事务或活动 cursor 时读取标记，避免旧 WAL 快照覆盖新结果。
     bool fresh(const Api &a, void *db) {
         if (!a.autocommit(db) || !a.next_stmt || !a.busy) return false;
         for (void *s = a.next_stmt(db, nullptr); s; s = a.next_stmt(db, s))
@@ -291,6 +292,7 @@ public:
             pending[std::make_pair(provider, db)] = path;
         }
     }
+    // 自己的消息交给宿主正常撤回；他人的原文保留并在同一事务里落撤回标记。
     int filter(const Api &a, const void *provider, void *db, const std::string &sql, void *original) {
         if (!a.prepare || !a.finalize || !a.step || !a.integer || !a.filename || !a.autocommit) return PASS;
         ConnectionLock connection(a, db);
