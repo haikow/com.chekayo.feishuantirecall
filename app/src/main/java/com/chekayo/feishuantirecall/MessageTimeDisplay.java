@@ -34,6 +34,9 @@ final class MessageTimeDisplay {
 
     /** 扫描只在后台线程执行，避免枚举宿主消息渲染类阻塞首屏。 */
     static void install(final ClassLoader loader) {
+        // 早期检查：如果已安装，直接返回，避免创建不必要的线程
+        if (installed) return;
+
         Thread scanner = new Thread(new Runnable() {
             @Override public void run() { scanAndInstall(loader); }
         }, "message-time-anchor");
@@ -271,7 +274,10 @@ final class MessageTimeDisplay {
         try {
             TextView tv = findTime(holder);
             if (tv == null) return;
-            resolveTimestamp(model.getClass());
+            // 只在首次初始化时解析 timestamp 方法，不在每次绑定时重复解析
+            if (timestampMethod == null && wrappedMessageMethod == null) {
+                resolveTimestamp(model.getClass());
+            }
             long seconds = timestamp(model);
             State state = new State(seconds, tv);
             VIEWS.put(tv, state);

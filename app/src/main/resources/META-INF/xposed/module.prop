@@ -1,7 +1,7 @@
 id=com.chekayo.feishuantirecall
 name=FeishuKit
-version=1.8.12-api102
-versionCode=1034
+version=1.8.13-api102
+versionCode=1035
 author=haikow
 description=FeishuKit：防撤回 / 防已读 / 离职档案。设置在飞书「设置 → 实验室」后的「模块设置」
 minApiVersion=102

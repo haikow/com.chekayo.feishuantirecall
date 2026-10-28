@@ -246,7 +246,7 @@ public:
         bool hasTable;
         {
             Statement exists(a, db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='feishukit_recalled_v1'");
-            if (exists.step() != ROW) { if (a.trace) a.trace("snapshot lookup failed"); return false; }
+            if (exists.step() != ROW) { if (a.trace) a.trace("撤回标记表查询失败"); return false; }
             hasTable = a.integer(exists.s, 0) > 0;
         }
         if (hasTable) {
@@ -263,7 +263,7 @@ public:
         if (current.uid != value.uid) current = Snapshot{};
         current.uid = value.uid;
         current.marks.insert(value.marks.begin(), value.marks.end());
-        if (a.trace) a.trace(snapshots[path].marks.empty() ? "snapshot empty" : "snapshot loaded markers");
+        if (a.trace) a.trace(snapshots[path].marks.empty() ? "本账号撤回标记快照为空" : "已载入本账号撤回标记快照");
         return true;
     }
     void observe(const Api &a, const void *provider, void *db, bool messages) {
@@ -298,11 +298,11 @@ public:
         ConnectionLock connection(a, db);
         Write w = parse(sql);
         if (!w.valid) return PASS;
-        if (a.trace) a.trace("recall write recognized");
+        if (a.trace) a.trace("检测到符合撤回结构的messages写入，开始校验发送者和原文");
         const char *fn = a.filename(db, "main");
         std::string path = fn ? fn : "", uid = owner(path);
         long long me = number(uid);
-        if (!me) { if (a.trace) a.trace("database owner unknown"); return PASS; }
+        if (!me) { if (a.trace) a.trace("无法确认消息数据库所属账号，本次不修改写入"); return PASS; }
         // Never enter the destructive original statement on a transient metadata
         // failure: it would remain busy and prevent SAVEPOINT on a direct retry.
         // A statement already stepped by the host was previously passed through
@@ -324,10 +324,10 @@ public:
             }
             if (rc != DONE) return rc;
         }
-        if (!w.update && protect.empty()) { if (a.trace) a.trace("no eligible original"); return PASS; }
+        if (!w.update && protect.empty()) { if (a.trace) a.trace("未找到可安全保留的他人原文，交由飞书正常处理"); return PASS; }
         int result = exec(a, db, "SAVEPOINT feishukit_recall_guard");
         if (result != DONE) {
-            if (a.trace) a.trace("recall savepoint failed; original not executed"); return result;
+            if (a.trace) a.trace("撤回保护事务创建失败，已阻止破坏性原语句"); return result;
         }
         result = exec(a, db, "CREATE TABLE IF NOT EXISTS feishukit_recalled_v1 ("
                 "message_id INTEGER PRIMARY KEY,chat_id INTEGER NOT NULL)");
@@ -355,7 +355,7 @@ public:
             }
         }
         if (result != DONE) {
-            if (a.trace) a.trace("recall transaction failed; rolling back");
+            if (a.trace) a.trace("撤回保护事务失败，正在回滚以保护原文");
             exec(a, db, "ROLLBACK TO feishukit_recall_guard");
             exec(a, db, "RELEASE feishukit_recall_guard");
             return result;
@@ -367,7 +367,7 @@ public:
             return result;
         }
         changed(a, provider, db, path);
-        if (a.trace) a.trace("recall transaction completed");
+        if (a.trace) a.trace("撤回写入已安全处理：原文保留，撤回标记已记录");
         return result;
     }
 };

@@ -24,8 +24,13 @@ Android（Xposed/LSPosed 模块，包名 `com.chekayo.feishuantirecall`）：
 |---|---|
 | **防撤回** | 自己撤回走飞书正常流程；他人原文保留，灰色虚线跟随实际气泡轮廓，不新增提示行；已撤回消息仅保留查看、复制和下载操作 |
 | **防对方已读** | 清空出站已读回执的 message 列表，只看不回＝未读 |
+| **单条标记已读** | 长按消息菜单手动将单条消息标记为已读 |
 | **后台消息存档** | 从通知回捞后台被撤回消息的原文 |
 | **屏蔽消息速览** | 隐藏 AI 总结「消息速览」浮层（整条） |
+| **屏蔽相关知识** | 屏蔽消息下的相关知识推荐 |
+| **消息时间常驻** | 时间显示与格式化可独立设置 |
+| **界面与数据管理** | 设置面板、数据备份、档案分类和账号隔离 |
+| **双 API 版本维护** | 同步维护 legacy API82 与 modern API102 构建 |
 | **移除聊天水印 / 解除下载与保密限制 / 审计无痕** | 设置面板「解除限制」分组 |
 | **被踢群 / 退群提醒** | 保留被移出群的本地记录，退群事件 Toast + 日志 |
 | **组织通讯录巡游 + 花名册归档** | 无障碍 DFS 走遍部门触发懒加载后归档 |
@@ -128,11 +133,12 @@ build.sh / build.ps1    一键构建（Linux / Windows）
 
 ## 贡献者 / Contributors
 
-感谢每一位让 FeishuKit 变得更好的贡献者（按首次贡献时间排序）：
+感谢每一位让 FeishuKit 变得更好的贡献者：
 
 | 贡献者 | 贡献 |
 |---|---|
-| [@SonderZhong](https://github.com/SonderZhong) | 数据备份导入导出、全员档案分类、账号数据隔离、撤回提示自定义（#2 #3） |
+| [@SonderZhong](https://github.com/SonderZhong) | 界面与设置体验、数据备份、档案分类、账号隔离、撤回提示、时间常驻、单条标记已读、消息速览与相关知识屏蔽、legacy / API102 双线维护 |
+| [@haikow](https://github.com/haikow) | 项目发起与社区维护 |
 | [@naiheSH](https://github.com/naiheSH) | 修复屏蔽消息速览误拦搜索页导致的闪退（#5） |
 | [@HansYeoh](https://github.com/HansYeoh) | 飞书 8.x 适配：messages 列序运行时自适应 + 双 provider hook（#6） |
 

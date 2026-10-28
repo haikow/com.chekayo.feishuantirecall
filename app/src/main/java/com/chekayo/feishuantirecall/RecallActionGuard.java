@@ -15,7 +15,6 @@ import io.github.libxposed.api.XposedInterface;
 /** 保留的原文只供查看/复制/下载，不再作为回复、转发或表情的服务端目标。 */
 final class RecallActionGuard {
     private static final String MESSAGE = "com.ss.android.lark.chat.entity.message.Message";
-    private static final String CONTEXT = "com.ss.android.lark.biz.im.extension.message_action.a";
     private static long lastNotice;
     private static final Map<Object, WeakReference<Object>> actionContexts =
             Collections.synchronizedMap(new WeakHashMap<Object, WeakReference<Object>>());
@@ -32,16 +31,30 @@ final class RecallActionGuard {
     static boolean blockedAction(Object action, Object message) {
         if (!blockedMessage(message)) return false;
         try {
-            Object type = Reflect.callMethod(action, "getType");
+            Object type = actionType(action);
             return !(type instanceof Enum) || !allowedAction(((Enum<?>) type).name());
         } catch (Throwable ignored) { return true; }
+    }
+
+    private static Object actionType(Object action) throws Throwable {
+        try { return Reflect.callMethod(action, "getType"); } catch (Throwable ignored) {}
+        Method found = null;
+        for (Method method : action.getClass().getMethods()) {
+            if (Modifier.isStatic(method.getModifiers()) || method.getParameterTypes().length != 0
+                    || !method.getReturnType().isEnum()) continue;
+            if (found != null) throw new NoSuchMethodException("ambiguous action type accessor");
+            found = method;
+        }
+        if (found == null) throw new NoSuchMethodException("action type accessor");
+        return found.invoke(action);
     }
 
     static boolean blockedMessage(Object message) {
         if (message == null || AntiRecall.TAMPER == 2) return false;
         try {
             return RecallMessages.marked(RecallMessages.account(),
-                    RecallMessages.value(message, "getChatId"), RecallMessages.value(message, "getId"));
+                    RecallMessages.messageText(message, "getChatId", ""),
+                    RecallMessages.messageText(message, "getId", ""));
         } catch (Throwable ignored) { return false; }
     }
     static boolean blockedId(String id, String chat) {
@@ -98,19 +111,26 @@ final class RecallActionGuard {
             "com.ss.android.lark.chat.message.menu.provider.ReactionActionProvider$ReactionMessageAction"
         };
         for (String name : actions) try {
-            Class<?> action = cl.loadClass(name), context = cl.loadClass(CONTEXT);
-            final Method message = findMessageGetter(context, cl.loadClass(MESSAGE));
+            Class<?> action = cl.loadClass(name), messageClass = cl.loadClass(MESSAGE);
             Field found = null;
-            for (Field f : action.getDeclaredFields()) if (!Modifier.isStatic(f.getModifiers()) && f.getType() == context) {
-                if (found != null) throw new NoSuchFieldException("ambiguous action context");
-                found = f;
+            Method message = null;
+            int contextCandidates = 0;
+            for (Field f : action.getDeclaredFields()) if (!Modifier.isStatic(f.getModifiers())) {
+                try {
+                    Method getter = findMessageGetter(f.getType(), messageClass);
+                    contextCandidates++;
+                    found = f;
+                    message = getter;
+                } catch (NoSuchMethodException ignored) {}
             }
-            if (found == null) throw new NoSuchFieldException("action context");
+            if (contextCandidates != 1 || found == null || message == null)
+                throw new NoSuchFieldException("操作上下文候选数=" + contextCandidates);
             final Field field = found;
+            final Method messageGetter = message;
             field.setAccessible(true);
             Target target = new Target() {
                 @Override public boolean blocked(Object receiver, java.util.List<Object> args) throws Throwable {
-                    return blockedMessage(message.invoke(field.get(receiver)));
+                    return blockedMessage(messageGetter.invoke(field.get(receiver)));
                 }
             };
             for (String predicate : new String[]{"isVisible", "isEnable"}) {
@@ -118,11 +138,11 @@ final class RecallActionGuard {
                 if (m.getReturnType() != boolean.class) throw new NoSuchMethodException(predicate);
                 HookRuntime.hook(m, "recall.action." + name + "." + predicate, new Guard(target, true));
             }
-            Method click = action.getDeclaredMethod("a", View.class, boolean.class);
-            if (click.getReturnType() != void.class) throw new NoSuchMethodException("action click");
+            Method click = findMethod(action, void.class, View.class, boolean.class);
             HookRuntime.hook(click, "recall.action." + name + ".click", new Guard(target, false));
-            Diag.once("[fucklark] recall action guard: " + name);
-        } catch (Throwable t) { Diag.once("[fucklark] recall action guard unavailable: " + name + ": " + t); }
+            Diag.once("[fucklark] 防撤回操作保护锚点命中：" + action.getName()
+                    + "；已按消息字段、可见状态和点击签名安装保护");
+        } catch (Throwable t) { Diag.once("[fucklark] 防撤回操作保护未安装：" + name + "；原因=" + t); }
 
         for (String name : new String[]{
                 "com.ss.android.lark.chat.chatwindow.chat.menu.handler.ReactionHandler",
@@ -149,8 +169,7 @@ final class RecallActionGuard {
                     return info != null && blockedMessage(getMessage.invoke(info));
                 }
             };
-            // APK 8.2.6: first argument is messageId; I2 toggles a reaction,
-            // e9 opens the reaction detail/more panel. Block before host side effects.
+            // The reaction entry points remain version-specific; install only when exact signatures match.
             Method toggle = type.getDeclaredMethod("I2", String.class, String.class, int.class);
             Method more = type.getDeclaredMethod("e9", String.class, String.class);
             if (toggle.getReturnType() != void.class || more.getReturnType() != void.class)
@@ -172,7 +191,7 @@ final class RecallActionGuard {
                 if (blockedId(id, null)) return true;
                 Object info = lookup.invoke(receiver, id);
                 if (info != null && blockedMessage(getMessage.invoke(info))) return true;
-                return blockedId(id, RecallMessages.value(receiver, "getChatId"));
+                return blockedId(id, RecallMessages.messageText(receiver, "getChatId", ""));
             }
         };
         for (String name : new String[]{"addReaction", "deleteReaction"}) {
@@ -185,14 +204,51 @@ final class RecallActionGuard {
 
     /** 统一筛选消息菜单，新增的未知操作默认不可用于已撤回目标。 */
     private static void installMenuPolicy(ClassLoader cl) throws Throwable {
-        Class<?> context = cl.loadClass(CONTEXT);
-        Class<?> action = cl.loadClass("com.ss.android.lark.biz.im.extension.message_action.j");
-        final Method message = findMessageGetter(context, cl.loadClass(MESSAGE));
+        Class<?> messageClass = cl.loadClass(MESSAGE);
         Class<?> manager = cl.loadClass("com.ss.android.lark.chat.message.menu.MessageActionManager");
-        Method filter = findMethod(manager, boolean.class, action, context, List.class);
-        HookRuntime.hook(filter, "recall.menu.policy", new XposedInterface.Hooker() {
+        Method filter = null, messageGetter = null;
+        int candidates = 0;
+        for (Method candidate : manager.getDeclaredMethods()) {
+            Class<?>[] p = candidate.getParameterTypes();
+            if (Modifier.isStatic(candidate.getModifiers()) || candidate.getReturnType() != boolean.class
+                    || p.length != 3) continue;
+            int listIndex = -1, contextIndex = -1, actionIndex = -1;
+            for (int i = 0; i < p.length; i++) {
+                if (List.class.isAssignableFrom(p[i])) {
+                    if (listIndex != -1) { listIndex = -2; break; }
+                    listIndex = i;
+                }
+            }
+            if (listIndex < 0) continue;
+            Method candidateGetter = null;
+            for (int i = 0; i < p.length; i++) {
+                if (i == listIndex) continue;
+                try {
+                    Method getter = findMessageGetter(p[i], messageClass);
+                    if (contextIndex != -1) { contextIndex = -2; break; }
+                    contextIndex = i;
+                    candidateGetter = getter;
+                } catch (NoSuchMethodException ignored) {}
+            }
+            if (contextIndex < 0 || candidateGetter == null) continue;
+            actionIndex = 3 - listIndex - contextIndex;
+            if (actionIndex < 0 || actionIndex >= 3 || actionIndex == contextIndex
+                    || actionIndex == listIndex || !hasUniqueEnumGetter(p[actionIndex])) continue;
+            candidates++;
+            filter = candidate;
+            messageGetter = candidateGetter;
+        }
+        if (candidates != 1) throw new NoSuchMethodException("菜单过滤方法候选数=" + candidates);
+        final Method selectedFilter = filter;
+        final Method message = messageGetter;
+        final int contextArg = findContextArgument(selectedFilter, messageClass);
+        final int listArg = listArgument(selectedFilter);
+        if (listArg < 0) throw new NoSuchMethodException("菜单列表参数不唯一");
+        final int actionArg = 3 - contextArg - listArg;
+        HookRuntime.hook(selectedFilter, "recall.menu.policy", new XposedInterface.Hooker() {
             @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
-                Object item = chain.getArg(0), ctx = chain.getArg(1);
+                Object item = chain.getArg(actionArg);
+                Object ctx = chain.getArg(contextArg);
                 try {
                     actionContexts.put(item, new WeakReference<Object>(ctx));
                     // Also guard menus opened before the recall arrived. Host callbacks
@@ -214,7 +270,38 @@ final class RecallActionGuard {
                 return chain.proceed();
             }
         });
-        Diag.once("[fucklark] recall menu policy: content access only");
+        Diag.once("[fucklark] 防撤回菜单锚点命中：" + selectedFilter.toGenericString()
+                + "；按消息对象访问器和操作枚举动态识别，撤回消息仅保留查看/复制/下载");
+    }
+
+    private static boolean hasUniqueEnumGetter(Class<?> type) {
+        int count = 0;
+        for (Method method : type.getMethods())
+            if (!Modifier.isStatic(method.getModifiers()) && method.getParameterTypes().length == 0
+                    && method.getReturnType().isEnum() && !method.isBridge()) count++;
+        return count == 1;
+    }
+
+    private static int findContextArgument(Method filter, Class<?> message) throws NoSuchMethodException {
+        int found = -1;
+        Class<?>[] params = filter.getParameterTypes();
+        for (int i = 0; i < params.length; i++) try {
+            findMessageGetter(params[i], message);
+            if (found != -1) throw new NoSuchMethodException("菜单上下文参数不唯一");
+            found = i;
+        } catch (NoSuchMethodException ignored) {}
+        if (found < 0) throw new NoSuchMethodException("菜单上下文参数未找到");
+        return found;
+    }
+
+    private static int listArgument(Method filter) {
+        int found = -1;
+        Class<?>[] params = filter.getParameterTypes();
+        for (int i = 0; i < params.length; i++) if (List.class.isAssignableFrom(params[i])) {
+            if (found != -1) return -1;
+            found = i;
+        }
+        return found;
     }
 
     static Method findMethod(Class<?> type, Class<?> returns, Class<?>... params) throws NoSuchMethodException {

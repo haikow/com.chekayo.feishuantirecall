@@ -86,7 +86,8 @@ final class RecallBubbleUi {
                         // MessageInfo.getMessage 在消息行反复取模型时执行反射。
                         RecallMessages.prepare(model);
                         bind(view, RecallMessages.account(),
-                                RecallMessages.value(model, "getChatId"), RecallMessages.value(model, "getId"));
+                                RecallMessages.messageText(model, "getChatId", ""),
+                                RecallMessages.messageText(model, "getId", ""));
                     }
                 } catch (Throwable ignored) {}
                 return result;

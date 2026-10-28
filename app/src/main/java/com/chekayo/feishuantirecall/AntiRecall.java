@@ -20,7 +20,7 @@ import io.github.libxposed.api.XposedInterface;
  *    仅在【主进程】装载 (其它进程/沙箱进程加载/重定位会崩, 且没有消息库)。
  *    安装动作由 Java 线程轮询 native tryInstall() 完成 (避免 raw pthread 上 PLT 惰性解析崩溃)。
  *
- * 2) Java 映射器层 (ax2.b.a): 打开聊天时把被撤回的 Content 顶回 + status 还原, 兜底。
+ * 2) Java 消息模型兜底: 按运行时泛型/返回类型发现内容访问器并按消息身份恢复原文。
  *
  * 生命周期: 不再实现 legacy 入口接口, 由唯一 modern 入口 FeishuKitModule 在
  * onPackageReady 调 {@link #install} 完成完整分发(幂等在入口层)。
@@ -52,9 +52,8 @@ public class AntiRecall {
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.8.12-api102";
-    static final int MODULE_VERSION_CODE = 1034;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
-    static final String MAPPER = "ax2.b";
+    static final String MODULE_VERSION = "1.8.13-api102";
+    static final int MODULE_VERSION_CODE = 1035;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
     static final String EXPECTED_SIG = "0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd";
@@ -62,7 +61,6 @@ public class AntiRecall {
     static volatile int TAMPER = 0;
     // APK 归档解析在部分 ROM 上较慢或会抛错；每进程只检查一次，错误仍按旧规则放行。
     private static volatile int SIGNATURE_STATE = 0; // 0=未检查，1=可信/读取失败放行，2=证书不匹配
-    static final String STATUS = "com.ss.android.lark.chat.entity.message.Message$Status";
 
 
     static volatile String MODULE_PATH = null;
@@ -84,6 +82,7 @@ public class AntiRecall {
     /** JNI: 读取已提交的撤回标记快照，不从 UI 线程访问飞书数据库连接。 */
     public static native boolean nativeIsRecallMarked(String uid, long chat, long id);
     public static native void nativeBindRecallAccount(String uid, String storage);
+    public static native void nativeSetLogDir(String dir);
 
     /** JNI: 诊断日志开关 (关=native flog 完全不写文件). */
     public static native void nativeSetDiag(boolean on);
@@ -243,39 +242,14 @@ public class AntiRecall {
         // pb 类名 com.bytedance.lark.pb.im.v1.UpdateMessagesMeReadRequest 稳定未混淆.
         try { installAntiRead2(classLoader); } catch (Throwable t) { alog("antiread2 install failed: " + t); }
 
-        // ---- 2) Java 映射器兜底 (版本自适应) ----
-        // 旧版飞书(≤7.70): 映射器 ax2.b.a(Object,int) 存在 -> 沿用【之前的方法】hook 它,
-        //   打开聊天时把撤回内容实时顶回 UI + 还原状态(无痕)。
-        // 新版飞书(≥7.71): 混淆器把短名 ax2.b 重排成无关类(Glide Headers), 该方法不存在
-        //   -> 走【新方式】: 仅依赖 native SQL 层(已在 7.71.8 真机验证撤回原文保留)。
-        // findMethodExactIfExists 只探测不抛异常, 据此路由, 不再对新版误报 NoSuchMethodError。
-        ClassLoader cl = classLoader;
-        boolean legacyMapper = false;
-        try {
-            // 标准反射探测: 旧版存在 ax2.b.a(Object,int); 新版该短名被重排, 探测失败.
-            Class<?> mc = cl.loadClass(MAPPER);
-            mc.getDeclaredMethod("a", Object.class, int.class);
-            legacyMapper = true;
-        } catch (Throwable t) {
-            legacyMapper = false;
+        // 单条消息标记已读功能
+        if (PKG.equals(currentProcessName())) {
+            try { ManualReadAction.install(classLoader); } catch (Throwable t) { alog("manual read action install failed: " + t); }
         }
-        if (legacyMapper) {
-            Object normal = null;
-            try {
-                normal = Reflect.getStaticObjectField(Reflect.findClass(STATUS, cl), "NORMAL");
-            } catch (Throwable t) {
-                ModuleLog.log("[antirecall] get NORMAL failed: " + t);
-            }
-            try {
-                HookRuntime.findAndHookMethod(MAPPER, cl, "a", new Class<?>[]{Object.class, int.class},
-                        "antirecall.mapper", new MapperHook(normal));
-                ModuleLog.log("[antirecall] 旧版飞书: Java 映射器 " + MAPPER + ".a 已挂 (legacy mode)");
-            } catch (Throwable t) {
-                ModuleLog.log("[antirecall] hook " + MAPPER + ".a failed: " + t);
-            }
-        } else {
-            ModuleLog.log("[antirecall] 新版飞书: 跳过旧映射器 " + MAPPER + "，使用 SQL 保留和 MessageInfo 兜底");
-        }
+
+        // ---- 2) Java 消息模型动态兜底（7.x/8.x 共用，无版本 mapper 名称分支） ----
+        // 消息内容访问器在首次真实消息模型出现时按返回契约动态发现；歧义时保持宿主原行为。
+        RecallMessages.enableDynamicContentRestore();
     }
 
     /**
@@ -593,7 +567,11 @@ public class AntiRecall {
         // 当前目标包的 files dir → 配置/日志/native 日志都按它走(国内/国际版自适应)。
         // 必须在 Config.load()/Diag.w() 之前, 否则它们用的还是 null 路径。
         File filesDir = new File(dataDir, "files");
-        try { Config.setFilesDir(filesDir); Diag.setFilesDir(filesDir); } catch (Throwable t) { ModuleLog.log("[antirecall] setFilesDir err " + t); }
+        try {
+            Config.setFilesDir(filesDir);
+            Diag.setFilesDir(filesDir);
+            nativeSetLogDir(filesDir.getAbsolutePath());
+        } catch (Throwable t) { ModuleLog.log("[antirecall] setFilesDir err " + t); }
         // native 写退群/被踢日志时也进当前账号子目录
         try {
             AccountPaths.bind(null, PKG);
@@ -625,6 +603,8 @@ public class AntiRecall {
         // 诊断日志: 环境信息(每次冷启动一条, 仅在诊断开关开启时写)。飞书 versionName 在 Installer 线程解析。
         Diag.w("==== 模块启动 v" + MODULE_VERSION
                 + " | 进程 " + currentProcessName() + " | abi " + android.os.Build.CPU_ABI + " ====");
+        Diag.w("启动诊断说明：防撤回分阶段显示SQLite钩子安装、消息库活动和撤回写入处理");
+        Diag.w("启动诊断说明：防撤回依次报告SQLite钩子安装、消息库活动和实际撤回写入处理");
 
         RecallMessages.restoreAccounts();
         // Install as soon as the SQLite library loads, before startup sync can
@@ -685,7 +665,7 @@ public class AntiRecall {
                     RecallMessages.refreshAccount();
                     if (installNativeHooks()) {
                         ModuleLog.log("[antirecall] SQLite hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次");
-                        Diag.w("防撤回: sqlite3_step hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次；等待实际撤回 SQL 命中");
+                        Diag.w("防撤回进度 1/3：SQLite拦截钩子已安装；正在观察消息库，尚未证明已命中撤回写入");
                         // 安装成功后转入维护循环: 周期重打被反篡改还原的 liblark hook + 轮询退群提醒.
                         android.os.Handler mh = new android.os.Handler(android.os.Looper.getMainLooper());
                         while (true) {
@@ -708,8 +688,8 @@ public class AntiRecall {
                 }
                 try { Thread.sleep(150); } catch (InterruptedException e) { return; }
             }
-            ModuleLog.log("[antirecall] tryInstall gave up (libsqlcipher not seen in time)");
-            Diag.w("防撤回: ✗ 安装失败 —— 120s 内未见 libsqlcipher.so (飞书可能改了加密库/该机型未加载/版本不兼容)");
+            ModuleLog.log("[antirecall] tryInstall gave up (no supported SQLite provider seen in time)");
+            Diag.w("防撤回失败：120秒内未发现可用SQLite数据库库（libwcdb2/libsqlcipher），请检查飞书版本与模块作用域");
         }
     }
 
@@ -1337,20 +1317,4 @@ public class AntiRecall {
         }
     }
 
-    static class MapperHook implements XposedInterface.Hooker {
-        final Object normal;
-        MapperHook(Object normal) { this.normal = normal; }
-
-        @Override
-        public Object intercept(XposedInterface.Chain chain) throws Throwable {
-            // before 反射改对象, 不短路: 原方法必须执行恰好一次。预处理包在吞异常 try 内,
-            // proceed 固定在 try 外一次(审计 F1: 被篡改/空参等提前返回分支的 proceed 曾
-            // 处于 catch 内, 异常被吞后原方法会被再执行一次)。
-            try {
-                Object item = chain.getArgs().get(0);
-                if (item != null) RecallMessages.prepare(Reflect.callMethod(item, "getMessage"));
-            } catch (Throwable ignored) {}
-            return chain.proceed();
-        }
-    }
 }

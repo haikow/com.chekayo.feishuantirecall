@@ -14,7 +14,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 /**
- * 统一设置面板：三页签（核心 / 记录 / 工具），覆盖旧版全部功能。
+ * 统一设置面板：四页签（核心 / 记录 / 工具 / 关于），覆盖旧版全部功能。
  * 在飞书进程内经 FuckLarkSettings 弹出；在模块桌面入口经 LauncherActivity 全屏展示。
  * 视觉规范见 {@link Ui}。
  */
@@ -63,16 +63,15 @@ final class SettingsPanel {
         page.setOrientation(LinearLayout.VERTICAL);
         root.addView(page, new LinearLayout.LayoutParams(-1, 0, 1f));
 
-        final String[] names = { "核心", "记录", "工具" };
-        final TextView[] tabs = new TextView[3];
-        final boolean[] built = new boolean[3];
+        final String[] names = { "核心", "记录", "工具", "关于" };
+        final TextView[] tabs = new TextView[4];
         LinearLayout bar = new LinearLayout(ctx);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setBackground(Ui.glass(ctx, 24, true));
         bar.setElevation(Ui.dp(ctx, 5));
         bar.setPadding(0, Ui.dp(ctx, 2), 0, Ui.dp(ctx, 2));
 
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < names.length; i++) {
             final int index = i;
             TextView tab = new TextView(ctx);
             tabs[i] = tab;
@@ -106,7 +105,8 @@ final class SettingsPanel {
         box.setPadding(Ui.dp(ctx, 12), Ui.dp(ctx, 4), Ui.dp(ctx, 12), Ui.dp(ctx, 8));
         if (index == 0) buildCore(ctx, box, standalone, tampered);
         else if (index == 1) buildRecords(ctx, box, standalone);
-        else buildTools(ctx, box, standalone, tampered);
+        else if (index == 2) buildTools(ctx, box, standalone, tampered);
+        else buildAbout(ctx, box, tampered);
         sv.addView(box);
         page.addView(sv, new LinearLayout.LayoutParams(-1, -1));
         for (int j = 0; j < tabs.length; j++) {
@@ -531,23 +531,66 @@ final class SettingsPanel {
         }
         box.addView(c2);
 
-        // 关于
-        box.addView(Ui.section(ctx, "关于"));
-        LinearLayout c3 = Ui.card(ctx);
-        c3.addView(Ui.navRow(ctx, "讨论群（Telegram）", "t.me/fucklark", Ui.ACCENT,
-                new View.OnClickListener() {
-            @Override public void onClick(View v) { DataViews.openUrl(ctx, "https://t.me/fucklark"); }
-        }));
-        if (!tampered) {
-            c3.addView(Ui.dividerRow(ctx));
-            c3.addView(Ui.navRow(ctx, "赞赏 FeishuKit", "微信扫码 · 纯属鼓励，与功能无关", 0xFFFF6B6B,
-                    new View.OnClickListener() {
-                @Override public void onClick(View v) { DataViews.showReward(ctx); }
-            }));
-        }
-        box.addView(c3);
+    }
 
-        box.addView(Ui.footer(ctx, "FeishuKit · 开源免费 · GPL-3.0"));
+    private static void buildAbout(final Context ctx, LinearLayout box, boolean tampered) {
+        box.addView(Ui.section(ctx, "FeishuKit"));
+        LinearLayout intro = Ui.card(ctx);
+        intro.setPadding(Ui.dp(ctx, 16), Ui.dp(ctx, 16), Ui.dp(ctx, 16), Ui.dp(ctx, 16));
+        TextView title = new TextView(ctx);
+        title.setText("FeishuKit"); title.setTextSize(22); title.setTypeface(null, android.graphics.Typeface.BOLD);
+        title.setTextColor(Ui.titleColor(ctx)); intro.addView(title);
+        TextView summary = new TextView(ctx);
+        summary.setText("飞书 / Lark 增强工具集\n开源免费 · GPL-3.0\n当前版本：" + DataViews.moduleVersion());
+        summary.setTextSize(13); summary.setTextColor(Ui.subColor(ctx));
+        summary.setPadding(0, Ui.dp(ctx, 6), 0, 0); intro.addView(summary); box.addView(intro);
+
+        box.addView(Ui.section(ctx, "项目链接"));
+        LinearLayout links = Ui.card(ctx);
+        links.addView(Ui.navRow(ctx, "项目主页", "github.com/haikow/com.chekayo.feishuantirecall", Ui.ACCENT,
+                new View.OnClickListener() { @Override public void onClick(View v) {
+                    DataViews.openUrl(ctx, "https://github.com/haikow/com.chekayo.feishuantirecall");
+                }}));
+        links.addView(Ui.dividerRow(ctx));
+        links.addView(Ui.navRow(ctx, "讨论群（Telegram）", "t.me/fucklark", Ui.ACCENT,
+                new View.OnClickListener() { @Override public void onClick(View v) {
+                    DataViews.openUrl(ctx, "https://t.me/fucklark");
+                }}));
+        if (!tampered) {
+            links.addView(Ui.dividerRow(ctx));
+            links.addView(Ui.navRow(ctx, "赞赏 FeishuKit", "微信扫码 · 纯属鼓励，与功能无关", 0xFFFF6B6B,
+                    new View.OnClickListener() { @Override public void onClick(View v) { DataViews.showReward(ctx); }}));
+        }
+        box.addView(links);
+
+        box.addView(Ui.section(ctx, "贡献者"));
+        contributors.addView(Ui.dividerRow(ctx));
+        addContributor(ctx, contributors, "haikow", "项目发起与社区维护者", "H");
+        LinearLayout contributors = Ui.card(ctx);
+        addContributor(ctx, contributors, "SonderZhong", "项目维护者 · 界面、功能数据与双 API 版本维护", "S");
+        contributors.addView(Ui.dividerRow(ctx));
+        addContributor(ctx, contributors, "naiheSH", "修复消息速览搜索页闪退问题", "N");
+        contributors.addView(Ui.dividerRow(ctx));
+        addContributor(ctx, contributors, "HansYeoh", "飞书 8.x 适配与双 provider hook", "H");
+        box.addView(contributors);
+        box.addView(Ui.footer(ctx, "感谢所有参与适配、测试和反馈的贡献者"));
+    }
+
+    private static void addContributor(final Context ctx, LinearLayout parent, final String user,
+                                       String contribution, String initial) {
+        LinearLayout row = new LinearLayout(ctx);
+        row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(Ui.dp(ctx, 12), Ui.dp(ctx, 10), Ui.dp(ctx, 12), Ui.dp(ctx, 10));
+        row.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+            DataViews.openUrl(ctx, "https://github.com/" + user);
+        }});
+        row.addView(ContributorAvatar.create(ctx, user, initial, 44));
+        LinearLayout text = new LinearLayout(ctx); text.setOrientation(LinearLayout.VERTICAL);
+        TextView name = new TextView(ctx); name.setText("@" + user); name.setTextSize(15);
+        name.setTypeface(null, android.graphics.Typeface.BOLD); name.setTextColor(Ui.titleColor(ctx)); text.addView(name);
+        TextView role = new TextView(ctx); role.setText(contribution); role.setTextSize(12); role.setTextColor(Ui.subColor(ctx));
+        role.setPadding(0, Ui.dp(ctx, 3), 0, 0); text.addView(role);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, -2, 1f); lp.leftMargin = Ui.dp(ctx, 12);
+        row.addView(text, lp); parent.addView(row);
     }
 
     // ── 解除限制二级面板 ────────────────────────────────────────────

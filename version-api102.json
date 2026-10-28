@@ -1,11 +1,11 @@
 {
-  "versionCode": 1034,
-  "versionName": "1.8.12-api102",
+  "versionCode": 1035,
+  "versionName": "1.8.13-api102",
   "channel": "https://t.me/fucklark",
-  "changelog": "· 重点适配飞书 8.2.6，API 82 / 102 同步功能\n· 新增撤回提示 / 消息颜色标识模式，支持边框颜色设置，默认红色虚线\n· 修复历史撤回消息按发送人还原导致的内容串位，完善列表复用清理\n· 调整消息时间锚点定位，新增按宿主版本和安装信息缓存，扫描完成后提示重启加载\n· 修正分身目录隔离，优化消息渲染与刷新调度\n· 修复屏蔽日志读取，改进版本与配置同步状态弹窗\n· 扫描与命中结果接入诊断日志，增加去重限流，修正尝试次数文案",
+  "changelog": "· 新增单条消息标记已读功能，支持动态定位网格菜单位置\n· 新增独立关于页签，展示版本、项目链接、许可证和贡献者信息\n· 关于页支持贡献者头像，离线时使用首字母占位\n· 修复切后台后防撤回消息丢失问题，为新版飞书添加 Java 层消息恢复兜底\n· 修复消息窗口刷新卡顿：普通消息不再重复执行账号查询和身份反射\n· 修复单条已读请求超时后无法再次重试的问题\n· 优化时间常驻锚点性能：避免重复扫描和方法解析，降低消息滚动时 CPU 占用\n· 优化后台维护循环：轮询间隔从 150ms 增加到 500ms，账号刷新降频至每 5 秒一次",
   "downloads": [
-    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1033-1.8.11-api102",
+    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/latest",
     "https://t.me/fucklark"
   ],
-  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1033-1.8.11-api102"
+  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/latest"
 }

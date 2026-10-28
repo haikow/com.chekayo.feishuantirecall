@@ -140,7 +140,7 @@ final class RecallTranslationUi {
             if (RecallMessages.markedMessage(uid, id)) return true;
             Object info = lookup.invoke(model.get(receiver), id);
             Object target = info == null ? null : message.invoke(info);
-            return target != null && RecallMessages.marked(uid, RecallMessages.value(target, "getChatId"), id);
+            return target != null && RecallMessages.marked(uid, RecallMessages.messageText(target, "getChatId", ""), id);
         }
     }
 
@@ -183,7 +183,8 @@ final class RecallTranslationUi {
         Binding previous = bindings.remove(view);
         if (previous != null) previous.dispose();
         String uid = RecallMessages.account();
-        String chat = RecallMessages.value(model, "getChatId"), id = RecallMessages.value(model, "getId");
+        String chat = RecallMessages.messageText(model, "getChatId", "");
+        String id = RecallMessages.messageText(model, "getId", "");
         if (RecallMessages.key(uid, chat, id) == null) return null;
         Binding binding = new Binding(view, uid, chat, id, controls);
         bindings.put(view, binding);
