@@ -566,10 +566,10 @@ final class SettingsPanel {
         box.addView(links);
 
         box.addView(Ui.section(ctx, "贡献者"));
-        contributors.addView(Ui.dividerRow(ctx));
-        addContributor(ctx, contributors, "haikow", "项目发起与社区维护者", "H");
         LinearLayout contributors = Ui.card(ctx);
         addContributor(ctx, contributors, "SonderZhong", "项目维护者 · 界面、功能数据与双 API 版本维护", "S");
+        contributors.addView(Ui.dividerRow(ctx));
+        addContributor(ctx, contributors, "haikow", "项目发起与社区维护者", "H");
         contributors.addView(Ui.dividerRow(ctx));
         addContributor(ctx, contributors, "naiheSH", "修复消息速览搜索页闪退问题", "N");
         contributors.addView(Ui.dividerRow(ctx));
