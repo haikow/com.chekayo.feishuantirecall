@@ -91,14 +91,16 @@ final class RecallBubbleUi {
                         // MessageInfo.getMessage 在列表反复取模型时触发大量反射。
                         String uid = RecallMessages.account();
                         RecallMessages.prepare(uid, model);
-                        bind(view, uid, RecallMessages.value(model, "getChatId"),
-                                RecallMessages.value(model, "getId"));
+                        bind(view, uid, RecallMessages.messageText(model, "getChatId", ""),
+                                RecallMessages.messageText(model, "getId", ""));
                     }
                 } catch (Throwable ignored) {}
             }
         });
         hookStatus = "已安装 " + bind.getDeclaringClass().getName() + "." + bind.getName();
-        Diag.once("[fucklark] 撤回气泡锚点命中: " + hookStatus);
+        Diag.once("[fucklark] 撤回气泡锚点命中: " + hookStatus
+                + " outline=" + outline.toGenericString()
+                + " bubbleField=" + bubble.toGenericString());
     }
     static void unbind(View view) {
         // 列表回收前移除旧 overlay、布局监听与无障碍文案，避免继承上一条的撤回样式。

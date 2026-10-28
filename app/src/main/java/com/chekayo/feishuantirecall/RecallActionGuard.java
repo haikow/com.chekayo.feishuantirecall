@@ -21,7 +21,6 @@ import de.robv.android.xposed.XposedHelpers;
  */
 final class RecallActionGuard {
     private static final String MESSAGE = "com.ss.android.lark.chat.entity.message.Message";
-    private static final String CONTEXT = "com.ss.android.lark.biz.im.extension.message_action.a";
     private static long lastNotice;
     private static final Map<Object, WeakReference<Object>> actionContexts =
             Collections.synchronizedMap(new WeakHashMap<Object, WeakReference<Object>>());
@@ -40,9 +39,23 @@ final class RecallActionGuard {
     static boolean blockedAction(Object action, Object message) {
         if (!blockedMessage(message)) return false;
         try {
-            Object type = XposedHelpers.callMethod(action, "getType");
+            Object type = actionType(action);
             return !(type instanceof Enum) || !allowedAction(((Enum<?>) type).name());
         } catch (Throwable ignored) { return true; }
+    }
+
+    private static Object actionType(Object action) throws Throwable {
+        try { return XposedHelpers.callMethod(action, "getType"); }
+        catch (Throwable ignored) {}
+        Method found = null;
+        for (Method method : action.getClass().getMethods()) {
+            if (Modifier.isStatic(method.getModifiers()) || method.getParameterTypes().length != 0
+                    || !method.getReturnType().isEnum()) continue;
+            if (found != null) throw new NoSuchMethodException("ambiguous action type getter");
+            found = method;
+        }
+        if (found == null) throw new NoSuchMethodException("action type getter");
+        return found.invoke(action);
     }
 
     static boolean blockedMessage(Object message) {
@@ -50,7 +63,8 @@ final class RecallActionGuard {
         if (message == null || AntiRecall.TAMPER == 2) return false;
         try {
             return RecallMessages.marked(RecallMessages.account(),
-                    RecallMessages.value(message, "getChatId"), RecallMessages.value(message, "getId"));
+                    RecallMessages.messageText(message, "getChatId", ""),
+                    RecallMessages.messageText(message, "getId", ""));
         } catch (Throwable ignored) { return false; }
     }
     static boolean blockedId(String id, String chat) {
@@ -103,80 +117,25 @@ final class RecallActionGuard {
         catch (Throwable t) { Diag.once("[fucklark] recall swipe policy unavailable: " + t); }
         try { installThreadReactions(cl.loadClass("com.ss.android.lark.replyinthread.pages.normal.ReplyInThreadViewModel"), cl.loadClass(MESSAGE)); }
         catch (Throwable t) { Diag.once("[fucklark] recall thread reaction guard unavailable: " + t); }
-        String[] actions = {
-            "com.ss.android.lark.chat.message.menu.provider.ChatReplyActionProvider$ReplyMessageAction",
-            "com.ss.android.lark.chat.messagemenu.provider.ChatThreadReplyActionProvider$ReplyMessageAction",
-            "com.ss.android.lark.chat.message.menu.provider.ReactionActionProvider$ReactionMessageAction"
-        };
-        for (String name : actions) try {
-            Class<?> action = cl.loadClass(name), context = cl.loadClass(CONTEXT);
-            final Method message = findMessageGetter(context, cl.loadClass(MESSAGE));
-            Field found = null;
-            for (Field f : action.getDeclaredFields()) if (!Modifier.isStatic(f.getModifiers()) && f.getType() == context) {
-                if (found != null) throw new NoSuchFieldException("ambiguous action context");
-                found = f;
-            }
-            if (found == null) throw new NoSuchFieldException("action context");
-            final Field field = found;
-            field.setAccessible(true);
-            Target target = new Target() {
-                @Override public boolean blocked(Object receiver, java.util.List<Object> args) throws Throwable {
-                    return blockedMessage(message.invoke(field.get(receiver)));
-                }
-            };
-            for (String predicate : new String[]{"isVisible", "isEnable"}) {
-                Method m = action.getDeclaredMethod(predicate);
-                if (m.getReturnType() != boolean.class) throw new NoSuchMethodException(predicate);
-                RecallHooks.hook(m, "recall.action." + name + "." + predicate, new Guard(target, true));
-            }
-            Method click = action.getDeclaredMethod("a", View.class, boolean.class);
-            if (click.getReturnType() != void.class) throw new NoSuchMethodException("action click");
-            RecallHooks.hook(click, "recall.action." + name + ".click", new Guard(target, false));
-            Diag.once("[fucklark] recall action guard: " + name);
-        } catch (Throwable t) { Diag.once("[fucklark] recall action guard unavailable: " + name + ": " + t); }
-
-        for (String name : new String[]{
-                "com.ss.android.lark.chat.chatwindow.chat.menu.handler.ReactionHandler",
-                "com.ss.android.lark.chat.chatwindow.chat.message.actionimpl.MessageReactionHandlerImpl"}) try {
-            Class<?> type = cl.loadClass(name);
-            Method found = null;
-            for (Method m : type.getDeclaredMethods()) {
-                if (Modifier.isStatic(m.getModifiers()) || m.getParameterTypes().length != 1
-                        || m.getParameterTypes()[0] != String.class) continue;
-                try { if (m.getReturnType().getMethod("getMessage").getReturnType() != cl.loadClass(MESSAGE)) continue; }
-                catch (NoSuchMethodException ignored) { continue; }
-                if (found != null) throw new NoSuchMethodException("ambiguous reaction message lookup");
-                found = m;
-            }
-            if (found == null) throw new NoSuchMethodException("reaction message lookup");
-            final Method lookup = found;
-            lookup.setAccessible(true);
-            final Method getMessage = lookup.getReturnType().getMethod("getMessage");
-            Target target = new Target() {
-                @Override public boolean blocked(Object receiver, java.util.List<Object> args) throws Throwable {
-                    String id = (String) args.get(0);
-                    if (blockedId(id, null)) return true;
-                    Object info = lookup.invoke(receiver, id);
-                    return info != null && blockedMessage(getMessage.invoke(info));
-                }
-            };
-            // 8.2.6：首参是 messageId；I2 切换表情，e9 打开表情详情。
-            // 只按已核验的签名安装，避免旧混淆名被重用后误 hook。
-            Method toggle = type.getDeclaredMethod("I2", String.class, String.class, int.class);
-            Method more = type.getDeclaredMethod("e9", String.class, String.class);
-            if (toggle.getReturnType() != void.class || more.getReturnType() != void.class)
-                throw new NoSuchMethodException("reaction entry shape");
-            RecallHooks.hook(toggle, "recall.action." + name + ".toggle", new Guard(target, false));
-            RecallHooks.hook(more, "recall.action." + name + ".more", new Guard(target, false));
-            Diag.once("[fucklark] recall reaction guard: " + name);
-        } catch (Throwable t) { Diag.once("[fucklark] recall reaction guard unavailable: " + name + ": " + t); }
     }
 
     static void installThreadReactions(Class<?> type, Class<?> message) throws Throwable {
         // 话题页已有表情条也能直接触发 add/deleteReaction，不能只限制普通消息菜单。
-        final Method lookup = type.getMethod("getMessageInfoById", String.class);
-        final Method getMessage = lookup.getReturnType().getMethod("getMessage");
-        if (getMessage.getReturnType() != message) throw new NoSuchMethodException("thread reaction message");
+        Method foundLookup = null;
+        Method foundGetMessage = null;
+        for (Method method : type.getMethods()) {
+            if (Modifier.isStatic(method.getModifiers()) || method.getParameterTypes().length != 1
+                    || method.getParameterTypes()[0] != String.class || method.getReturnType() == void.class) continue;
+            Method getter;
+            try { getter = findMessageGetter(method.getReturnType(), message); }
+            catch (NoSuchMethodException ignored) { continue; }
+            if (foundLookup != null) throw new NoSuchMethodException("ambiguous thread message lookup");
+            foundLookup = method;
+            foundGetMessage = getter;
+        }
+        if (foundLookup == null) throw new NoSuchMethodException("thread message lookup by shape");
+        final Method lookup = foundLookup;
+        final Method getMessage = foundGetMessage;
         Target target = new Target() {
             public boolean blocked(Object receiver, List<Object> args) throws Throwable {
                 // 8.2.6 参数为 (messageId, reactionType)，第二个字符串不是消息 ID。
@@ -184,24 +143,44 @@ final class RecallActionGuard {
                 if (blockedId(id, null)) return true;
                 Object info = lookup.invoke(receiver, id);
                 if (info != null && blockedMessage(getMessage.invoke(info))) return true;
-                return blockedId(id, RecallMessages.value(receiver, "getChatId"));
+                return blockedId(id, RecallMessages.messageText(receiver, "getChatId", ""));
             }
         };
-        for (String name : new String[]{"addReaction", "deleteReaction"}) {
-            Method method = type.getDeclaredMethod(name, String.class, String.class);
-            if (method.getReturnType() != void.class || Modifier.isStatic(method.getModifiers()))
-                throw new NoSuchMethodException("thread reaction entry");
-            RecallHooks.hook(method, "recall.thread." + name, new Guard(target, false));
+        int installed = 0;
+        for (Method method : type.getDeclaredMethods()) {
+            Class<?>[] params = method.getParameterTypes();
+            if (Modifier.isStatic(method.getModifiers()) || method.getReturnType() != void.class
+                    || params.length != 2 || params[0] != String.class || params[1] != String.class) continue;
+            String id = "recall.thread.reaction." + method.getDeclaringClass().getName() + "." + method.toGenericString();
+            RecallHooks.hook(method, id, new Guard(target, false));
+            installed++;
         }
+        if (installed == 0) throw new NoSuchMethodException("thread reaction methods by signature");
+        Diag.once("[fucklark] thread reaction anchors matched: lookup=" + lookup.toGenericString()
+                + " messageGetter=" + getMessage.toGenericString() + " actions=" + installed);
     }
 
     /** 统一筛选消息菜单，新增的未知操作默认不可用于已撤回目标。 */
     private static void installMenuPolicy(ClassLoader cl) throws Throwable {
-        Class<?> context = cl.loadClass(CONTEXT);
-        Class<?> action = cl.loadClass("com.ss.android.lark.biz.im.extension.message_action.j");
-        final Method message = findMessageGetter(context, cl.loadClass(MESSAGE));
         Class<?> manager = cl.loadClass("com.ss.android.lark.chat.message.menu.MessageActionManager");
-        Method filter = findMethod(manager, boolean.class, action, context, List.class);
+        Class<?> messageClass = cl.loadClass(MESSAGE);
+        Method filter = null, messageGetter = null;
+        for (Method method : manager.getDeclaredMethods()) {
+            Class<?>[] params = method.getParameterTypes();
+            if (Modifier.isStatic(method.getModifiers()) || method.getReturnType() != boolean.class
+                    || params.length != 3 || !List.class.isAssignableFrom(params[2])) continue;
+            Method candidate;
+            try { candidate = findMessageGetter(params[1], messageClass); }
+            catch (NoSuchMethodException ignored) { continue; }
+            if (filter != null) throw new NoSuchMethodException("ambiguous message-menu filter");
+            filter = method;
+            messageGetter = candidate;
+        }
+        if (filter == null) throw new NoSuchMethodException("message-menu filter by parameter shape");
+        final Method message = messageGetter;
+        filter.setAccessible(true);
+        Diag.once("[fucklark] message-menu filter matched: " + filter.toGenericString()
+                + " messageGetter=" + message.toGenericString());
         RecallHooks.hook(filter, "recall.menu.policy", new XC_MethodHook() {
             @Override protected void beforeHookedMethod(MethodHookParam param) {
                 Object item = param.args[0], ctx = param.args[1];
@@ -209,7 +188,7 @@ final class RecallActionGuard {
                     actionContexts.put(item, new WeakReference<Object>(ctx));
                     // 已打开的菜单可能在撤回前创建：过滤显示还不够，点击时必须再次查标记。
                     // 正常消息及白名单动作仍沿用宿主点击回调。
-                    Method click = item.getClass().getMethod("a", View.class, boolean.class);
+                    Method click = findClickMethod(item.getClass());
                     String clickId = "recall.menu.click." + click.getDeclaringClass().getName();
                     if (click.getReturnType() == void.class && !RecallHooks.installed(clickId)) RecallHooks.hook(click,
                             clickId, new Guard(new Target() {
@@ -226,6 +205,19 @@ final class RecallActionGuard {
             }
         });
         Diag.once("[fucklark] recall menu policy: content access only");
+    }
+
+    private static Method findClickMethod(Class<?> type) throws NoSuchMethodException {
+        Method found = null;
+        for (Method method : type.getMethods()) {
+            Class<?>[] params = method.getParameterTypes();
+            if (Modifier.isStatic(method.getModifiers()) || method.getReturnType() != void.class
+                    || params.length != 2 || params[0] != View.class || params[1] != boolean.class) continue;
+            if (found != null) throw new NoSuchMethodException("ambiguous menu action click method");
+            found = method;
+        }
+        if (found == null) throw new NoSuchMethodException("menu action click method by shape");
+        return found;
     }
 
     static Method findMethod(Class<?> type, Class<?> returns, Class<?>... params) throws NoSuchMethodException {

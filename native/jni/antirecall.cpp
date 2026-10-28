@@ -35,12 +35,12 @@
 // 供终端用户在设置面板一键复制发作者排查“防撤回不生效”。带 MM-dd HH:mm:ss 时间戳。
 static volatile int g_diag_log = 0;   // 诊断日志开关(Java 经 nativeSetDiag 设置); 0=不写文件
 
-// 当前目标包的 files 目录(Java 经 nativeSetDataDir 设置; 默认国内版路径做 fallback,
-// 国际版 Lark 起来后会被覆盖成 /data/data/com.larksuite.suite/files)。
+// 业务文件目录与用户可见诊断日志目录分离；日志统一放 files 根目录。
 static char g_data_dir[256] = "/data/data/com.ss.android.lark/files";
+static char g_log_dir[256] = "/data/data/com.ss.android.lark/files";
 static void flog(const char *fmt, ...) {
     if (!g_diag_log) return;
-    char _p[320]; snprintf(_p, sizeof _p, "%s/fucklark_log.txt", g_data_dir);
+    char _p[320]; snprintf(_p, sizeof _p, "%s/fucklark_log.txt", g_log_dir);
     FILE *f = fopen(_p, "a");
     if (!f) return;
     time_t t = time(nullptr);
@@ -1010,7 +1010,7 @@ static int step_common(SqlProv *pv, void *stmt) {
         static unsigned long long recallScans = 0;
         if (g_diag_log && __atomic_add_fetch(&recallScans, 1, __ATOMIC_RELAXED) == 1) {
             LOGI("RECALL-ANCHOR: first messages statement reached provider=%s", pv->so);
-            flog("防撤回锚点: 首次 messages SQL 命中 provider=%s", pv->so);
+            flog("防撤回进度 2/3：已观察到消息库SQL活动，provider=%s；等待撤回写入命中", pv->so);
         }
         char *expanded = pv->exp(stmt);
         if (expanded) {
@@ -1019,7 +1019,7 @@ static int step_common(SqlProv *pv, void *stmt) {
             if (result != recall::PASS) {
                 if (result == recall::DONE) {
                     int n = ++g_neutralized;
-                    flog("防撤回: 撤回写入已处理 累计=%d", n);
+                    flog("防撤回成功 3/3：已安全处理一条他人撤回写入，原文保留、撤回标记已保存（累计=%d）", n);
                 }
                 return result;
             }
@@ -1783,6 +1783,17 @@ Java_com_chekayo_feishuantirecall_AntiRecall_nativeSetDataDir(JNIEnv *env, jclas
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_chekayo_feishuantirecall_AntiRecall_nativeSetLogDir(JNIEnv *env, jclass, jstring d) {
+    if (!d) return;
+    const char *c = env->GetStringUTFChars(d, nullptr);
+    if (c) {
+        strncpy(g_log_dir, c, sizeof g_log_dir - 1);
+        g_log_dir[sizeof g_log_dir - 1] = 0;
+        env->ReleaseStringUTFChars(d, c);
+    }
+}
+
 // Java 维护线程轮询取一条待弹的"退群/被移除"提醒(无则返回 null)。
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_chekayo_feishuantirecall_AntiRecall_nativePollLeaveEvent(JNIEnv *env, jclass) {
@@ -1840,7 +1851,7 @@ static bool try_prov(SqlProv *p) {
     memcpy(p->hookbytes, step, 16);   // 记录 hook 后的入口字节, 供 maintain 检测被还原
     p->installed = true;
     LOGI("ANTI-RECALL native hook installed on %s sqlite3_step @%p", p->so, step);
-    flog("防撤回扫描: provider=%s sqlite3_step 锚点命中并已安装", p->so);
+    flog("防撤回进度 1/3：SQLite拦截钩子已安装，数据库=%s；尚未证明已命中撤回", p->so);
     return true;
 }
 

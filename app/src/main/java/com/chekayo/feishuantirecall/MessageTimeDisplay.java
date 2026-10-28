@@ -37,6 +37,9 @@ final class MessageTimeDisplay {
 
     /** 扫描只在后台线程执行，避免枚举宿主消息渲染类阻塞首屏。 */
     static void install(final ClassLoader loader) {
+        // 早期检查：如果已安装，直接返回，避免创建不必要的线程
+        if (installed) return;
+
         Thread scanner = new Thread(new Runnable() {
             @Override public void run() { scanAndInstall(loader); }
         }, "message-time-anchor");
@@ -188,8 +191,10 @@ final class MessageTimeDisplay {
             Method conventional;
             try { conventional = type.getMethod("getCreateTime"); }
             catch (NoSuchMethodException absent) { conventional = type.getMethod("c"); }
-            if (conventional.getParameterTypes().length == 0 && conventional.getReturnType() == long.class)
+            if (conventional.getParameterTypes().length == 0 && conventional.getReturnType() == long.class) {
+                Diag.w("时间锚点: 时间 getter 命中 " + conventional.toGenericString());
                 return conventional;
+            }
         } catch (Throwable ignored) { }
         Method found = null;
         for (Method method : type.getMethods()) {
@@ -198,6 +203,7 @@ final class MessageTimeDisplay {
             if (found != null) return null;
             found = method;
         }
+        if (found != null) Diag.w("时间锚点: 动态时间 getter 命中 " + found.toGenericString());
         return found;
     }
 
@@ -275,7 +281,10 @@ final class MessageTimeDisplay {
         try {
             TextView tv = findTime(holder);
             if (tv == null) return;
-            resolveTimestamp(model.getClass());
+            // 只在首次初始化时解析 timestamp 方法，不在每次绑定时重复解析
+            if (timestampMethod == null && wrappedMessageMethod == null) {
+                resolveTimestamp(model.getClass());
+            }
             long seconds = timestamp(model);
             State state = new State(seconds, tv);
             VIEWS.put(tv, state);

@@ -25,7 +25,7 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
  *    仅在【主进程】装载 (其它进程/沙箱进程加载/重定位会崩, 且没有消息库)。
  *    安装动作由 Java 线程轮询 native tryInstall() 完成 (避免 raw pthread 上 PLT 惰性解析崩溃)。
  *
- * 2) Java 映射器层 (ax2.b.a): 打开聊天时把被撤回的 Content 顶回 + status 还原, 兜底。
+ * 2) Java 消息模型兜底: 首次遇到模型时动态发现内容 getter，按账号/会话/消息缓存原文。
  */
 public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit {
 
@@ -54,9 +54,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.8.12";
-    static final int MODULE_VERSION_CODE = 34;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
-    static final String MAPPER = "ax2.b";
+    static final String MODULE_VERSION = "1.8.13";
+    static final int MODULE_VERSION_CODE = 35;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
     static final String EXPECTED_SIG = "0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd";
@@ -64,7 +63,6 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     static volatile int TAMPER = 0;
     // 归档证书解析只做一次；PackageManager 在部分 ROM 上解析模块 APK 很慢或会抛错。
     private static volatile int SIGNATURE_STATE = 0; // 0=未检查，1=可信/读取失败放行，2=证书不匹配
-    static final String STATUS = "com.ss.android.lark.chat.entity.message.Message$Status";
 
     static volatile String MODULE_PATH = null;
     static volatile boolean NATIVE_STARTED = false;
@@ -77,6 +75,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
 
     /** JNI: 走专属 logcat tag "antiread-j" (避开被其它模块刷爆的 LSPosedFramework). */
     public static native void nativeLog(String s);
+    /** JNI: native 撤回诊断与 Java 诊断共用 files/fucklark_log.txt；业务数据仍写账号目录。 */
+    public static native void nativeSetLogDir(String dir);
 
     /** JNI: FeishuKit 设置面板实时开关防撤回中和. */
     public static native void nativeSetRecall(boolean on);
@@ -234,39 +234,10 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         //   rustclient jk(UPDATE_MESSAGES_ME_READ, UpdateMessagesMeReadRequest{message_ids,max_position,...}).
         // pb 类名 com.bytedance.lark.pb.im.v1.UpdateMessagesMeReadRequest 稳定未混淆.
         try { installAntiRead2(lpparam.classLoader); } catch (Throwable t) { alog("antiread2 install failed: " + t); }
+        if (PKG.equals(currentProcessName())) ManualReadAction.install(lpparam.classLoader);
 
-        // ---- 2) Java 映射器兜底 (版本自适应) ----
-        // 旧版飞书(≤7.70): 映射器 ax2.b.a(Object,int) 存在 -> 沿用【之前的方法】hook 它,
-        //   打开聊天时把撤回内容实时顶回 UI + 还原状态(无痕)。
-        // 新版飞书(≥7.71): 混淆器把短名 ax2.b 重排成无关类(Glide Headers), 该方法不存在
-        //   -> 走【新方式】: 仅依赖 native SQL 层(已在 7.71.8 真机验证撤回原文保留)。
-        // findMethodExactIfExists 只探测不抛异常, 据此路由, 不再对新版误报 NoSuchMethodError。
-        ClassLoader cl = lpparam.classLoader;
-        boolean legacyMapper = false;
-        try {
-            // 标准反射探测: 旧版存在 ax2.b.a(Object,int); 新版该短名被重排, 探测失败.
-            Class<?> mc = cl.loadClass(MAPPER);
-            mc.getDeclaredMethod("a", Object.class, int.class);
-            legacyMapper = true;
-        } catch (Throwable t) {
-            legacyMapper = false;
-        }
-        if (legacyMapper) {
-            Object normal = null;
-            try {
-                normal = XposedHelpers.getStaticObjectField(XposedHelpers.findClass(STATUS, cl), "NORMAL");
-            } catch (Throwable t) {
-                XposedBridge.log("[antirecall] get NORMAL failed: " + t);
-            }
-            try {
-                XposedHelpers.findAndHookMethod(MAPPER, cl, "a", Object.class, int.class, new MapperHook(normal));
-                XposedBridge.log("[antirecall] 旧版飞书: Java 映射器 " + MAPPER + ".a 已挂 (legacy mode)");
-            } catch (Throwable t) {
-                XposedBridge.log("[antirecall] hook " + MAPPER + ".a failed: " + t);
-            }
-        } else {
-            XposedBridge.log("[antirecall] 新版飞书: 跳过旧映射器，使用 SQL 保留和 MessageInfo 兜底");
-        }
+        // 7.x and 8.x share the runtime-discovered getter hook; no version-specific mapper.
+        RecallMessages.enableDynamicContentRestore();
     }
 
     /**
@@ -560,7 +531,11 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         // 当前目标包的 files dir → 配置/日志/native 日志都按它走(国内/国际版自适应)。
         // 必须在 Config.load()/Diag.w() 之前, 否则它们用的还是 null 路径。
         File filesDir = new File(dataDir, "files");
-        try { Config.setFilesDir(filesDir); Diag.setFilesDir(filesDir); } catch (Throwable t) { XposedBridge.log("[antirecall] setFilesDir err " + t); }
+        try {
+            Config.setFilesDir(filesDir);
+            Diag.setFilesDir(filesDir);
+            nativeSetLogDir(filesDir.getAbsolutePath());
+        } catch (Throwable t) { XposedBridge.log("[antirecall] setFilesDir err " + t); }
         // native 写退群/被踢日志时也进当前账号子目录
         try {
             AccountPaths.bind(null, PKG);
@@ -592,6 +567,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         // 诊断日志: 环境信息(每次冷启动一条, 仅在诊断开关开启时写)。飞书 versionName 在 Installer 线程解析。
         Diag.w("==== 模块启动 v" + MODULE_VERSION
                 + " | 进程 " + currentProcessName() + " | abi " + android.os.Build.CPU_ABI + " ====");
+        Diag.w("动态锚点策略: 消息模型/菜单/已读请求按签名与类型发现；协议类名仅作候选锚点；歧义时降级");
 
         RecallMessages.restoreAccounts();
 
@@ -629,7 +605,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     RecallMessages.refreshAccount();
                     if (tryInstall()) {
                         XposedBridge.log("[antirecall] SQLite hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次");
-                        Diag.w("防撤回: sqlite3_step hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次；等待实际撤回 SQL 命中");
+                        Diag.w("防撤回进度 1/3：SQLite 拦截钩子已安装；正在观察消息库，尚未证明已命中撤回写入");
                         // 安装成功后转入维护循环: 周期重打被反篡改还原的 liblark hook + 轮询退群提醒.
                         android.os.Handler mh = new android.os.Handler(android.os.Looper.getMainLooper());
                         while (true) {
@@ -651,8 +627,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 }
                 try { Thread.sleep(150); } catch (InterruptedException e) { return; }
             }
-            XposedBridge.log("[antirecall] tryInstall gave up (libsqlcipher not seen in time)");
-            Diag.w("防撤回: ✗ 安装失败 —— 120s 内未见 libsqlcipher.so (飞书可能改了加密库/该机型未加载/版本不兼容)");
+            XposedBridge.log("[antirecall] tryInstall gave up (no supported SQLite provider seen in time)");
+            Diag.w("防撤回失败：120 秒内未发现可用 SQLite provider（libwcdb2/libsqlcipher），请检查飞书版本与模块作用域");
         }
     }
 
@@ -770,16 +746,24 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         return hits;
     }
 
-    /** 安装 Kn 截获(全部候选常驻) + 栈定夺重放方法; 发现失败自动降级纯载体模式。 */
+    /**
+     * 按“同包请求对象 + 框架回调 + void 返回”发现已读发送入口。
+     * 多候选全部截获，首次真实读请求再用调用栈确认；零候选时只保留构造器兜底。
+     */
     static void installKnReplay(ClassLoader cl) {
         try {
             Class<?> impl = cl.loadClass(IM_MSG_SERVICE_V2);
             Class<?> cbCls = cl.loadClass(KN_CB_CLASS);
             java.util.List<java.lang.reflect.Method> cands = discoverKn(impl, cbCls);
             if (cands.isEmpty()) throw new IllegalStateException("Kn 签名形状零命中");
+            StringBuilder matched = new StringBuilder();
             for (java.lang.reflect.Method c : cands) {
                 XposedBridge.hookMethod(c, new KnCaptureHook());
+                if (matched.length() > 0) matched.append(" | ");
+                matched.append(c.toGenericString());
             }
+            Diag.once("[fucklark] read-send anchors matched: impl=" + impl.getName()
+                    + " callback=" + cbCls.getName() + " candidates=" + matched);
             knImplClass = impl;
             knCandidates = cands;
             if (cands.size() == 1) {
@@ -792,6 +776,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         } catch (Throwable t) {
             KN_READY = false;
             alog("Kn 重放通道不可用(仅载体兜底, 老版本行为不变): " + describe(t));
+            Diag.once("[fucklark] read-send dynamic anchor unavailable: " + describe(t));
         }
     }
 
@@ -802,6 +787,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         knCandidates = null;
         KN_READY = true;
         alog("已读补报通道就绪: Kn 重放 (" + knM.getDeclaringClass().getSimpleName() + "#" + knM.getName() + ")");
+        Diag.once("[fucklark] read-send replay selected: " + knM.toGenericString());
     }
 
     /** 从读请求构造的调用栈上认领重放方法: 真实方法帧必然在栈上(类名+方法名对号入座)。
@@ -1045,10 +1031,13 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         // 构造函数参数序(Wire build()): (message_ids[0], channel[1], max_position[2], thread_id[3],
         //   _[4], max_position_badge_count[5], _[6], fold_ids[7], [unknownFields[8]]).
         XposedBridge.hookAllConstructors(reqc, new ReadReqHook());
+        Diag.once("[fucklark] read-request anchor matched: " + reqc.getName()
+                + " constructors=" + reqc.getDeclaredConstructors().length);
         // 发送开窗: 复刻桌面吾乐吧/Linux —— 纯浏览未读, 回复后才把可视消息标已读。
         for (String sc : SEND_REQ_CLASSES) {
             try { XposedBridge.hookAllConstructors(cl.loadClass(sc), new SendReqHook());
-                  alog("antiread2: 发送开窗 hook " + sc); }
+                  alog("antiread2: 发送开窗 hook " + sc);
+                  Diag.once("[fucklark] read-window request matched: " + sc); }
             catch (Throwable t) { alog("antiread2: 发送类 " + sc + " 不存在: " + t); }
         }
         // 表情回复触发: CreateReactionRequest(message_id, type) —— 贴表情视同回复, 触发该会话重放。
@@ -1056,6 +1045,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
             XposedBridge.hookAllConstructors(cl.loadClass("com.bytedance.lark.pb.im.v1.CreateReactionRequest"),
                     new ReactionHook());
             alog("antiread2: 表情回复触发 hook CreateReactionRequest");
+            Diag.once("[fucklark] reaction request anchor matched: com.bytedance.lark.pb.im.v1.CreateReactionRequest");
         } catch (Throwable t) {
             alog("antiread2: 表情回复类不存在(该版本无贴表情?): " + t);
         }
@@ -1200,17 +1190,4 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         }
     }
 
-    static class MapperHook extends XC_MethodHook {
-        final Object normal;
-        MapperHook(Object normal) { this.normal = normal; }
-
-        @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
-            try {
-                Object item = param.args[0];
-                if (item != null) RecallMessages.prepare(XposedHelpers.callMethod(item, "getMessage"));
-            } catch (Throwable ignore) {
-            }
-        }
-    }
 }

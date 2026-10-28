@@ -36,6 +36,8 @@ final class RecallTranslationUi {
                 || animation.getDeclaredMethod("b").getReturnType() != boolean.class)
             throw new NoSuchMethodException("translation animation lifecycle");
         stopAnimation = stop;
+        Diag.once("[fucklark] translation lifecycle matched: class=" + animation.getName()
+                + " stop=" + stop.toGenericString() + " start=" + start.toGenericString());
         RecallHooks.hook(start, "recall.translation.start", new StartHook());
         try { installChat(cl, animation); }
         catch (Throwable t) { Diag.once("[fucklark] recall chat translation unavailable: " + t); }
@@ -55,6 +57,8 @@ final class RecallTranslationUi {
         Class<?> model = bind.getParameterTypes()[1];
         Method click = RecallActionGuard.findMethod(block, void.class, holder, model, View.class);
         Method longClick = RecallActionGuard.findMethod(block, boolean.class, holder, model, View.class);
+        Diag.once("[fucklark] translation chat anchors matched: bind=" + bind.toGenericString()
+                + " click=" + click.toGenericString() + " longClick=" + longClick.toGenericString());
         RecallHooks.hook(bind, "recall.translation.bind", new BindHook(view));
         RecallActionGuard.Target target = new RecallActionGuard.Target() {
             @Override public boolean blocked(Object receiver, java.util.List<Object> args) {
@@ -74,6 +78,7 @@ final class RecallTranslationUi {
         if (view.getType() != animation || !View.class.isAssignableFrom(label.getType())
                 || !View.class.isAssignableFrom(container.getType())) throw new NoSuchFieldException("thread translation views");
         Method bind = RecallBubbleUi.findBind(block, holder);
+        Diag.once("[fucklark] translation thread bind matched: " + bind.toGenericString());
         RecallHooks.hook(bind, "recall.translation.thread.bind", new BindHook(view, label, container));
         Class<?> click = cl.loadClass(name + "$a");
         Field captured = click.getDeclaredField("b");
@@ -141,7 +146,7 @@ final class RecallTranslationUi {
             if (RecallMessages.markedMessage(uid, id)) return true;
             Object info = lookup.invoke(model.get(receiver), id);
             Object target = info == null ? null : message.invoke(info);
-            return target != null && RecallMessages.marked(uid, RecallMessages.value(target, "getChatId"), id);
+            return target != null && RecallMessages.marked(uid, RecallMessages.messageText(target, "getChatId", ""), id);
         }
     }
 
@@ -188,7 +193,8 @@ final class RecallTranslationUi {
         Binding previous = bindings.remove(view);
         if (previous != null) previous.dispose();
         String uid = RecallMessages.account();
-        String chat = RecallMessages.value(model, "getChatId"), id = RecallMessages.value(model, "getId");
+        String chat = RecallMessages.messageText(model, "getChatId", "");
+        String id = RecallMessages.messageText(model, "getId", "");
         if (RecallMessages.key(uid, chat, id) == null) return null;
         Binding binding = new Binding(view, uid, chat, id, controls);
         bindings.put(view, binding);
