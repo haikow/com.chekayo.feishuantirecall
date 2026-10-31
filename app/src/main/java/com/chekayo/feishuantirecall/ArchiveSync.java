@@ -52,23 +52,41 @@ public final class ArchiveSync {
         try {
             if (name == null || !(name.endsWith(".json") || name.endsWith(".txt"))) return;
             Context c = Config.appContextForSync();
-            if (c == null) return;
-            File f = findLarkFile(name);
-            if (f == null || !f.exists() || f.length() == 0) return;
+            if (c == null) { Diag.w("档案同步: Application 未就绪 " + name); return; }
+            String uid = AccountPaths.currentUid;
+            File f = findLarkFile(c, uid, name);
+            if (f == null || !f.exists() || f.length() == 0) {
+                Diag.w("档案同步: 找不到当前账号文件 " + name + " root=" + c.getFilesDir());
+                return;
+            }
+            String relative = name.endsWith(".json") ? "resign_tracker/" + name : name;
+            File scoped = new File(c.getFilesDir(), "accounts/" + AccountPaths.safeUid(uid) + "/" + relative);
+            if (!f.equals(scoped)) uid = null; // 旧全局数据没有可靠账号归属。
             if (f.length() > 8L * 1024 * 1024) return;
             byte[] data = Config.readBytes(f);
-            if (data == null || data.length == 0) return;
+            if (data == null || data.length == 0) {
+                Diag.w("档案同步: 读取源文件失败 " + name + " length=" + f.length());
+                return;
+            }
             try {
-                Bundle extras = new Bundle(); extras.putByteArray("data", data);
+                Bundle extras = new Bundle();
+                extras.putByteArray("data", data);
+                extras.putString("uid", uid);
                 Bundle result = c.getContentResolver().call(ConfigProvider.URI, "putFile", name, extras);
-                if (result != null && result.getBoolean("ok")) return;
+                if (result != null && result.getBoolean("ok")) {
+                    Diag.w("档案同步: 已确认 " + name + " bytes=" + data.length + " scoped=" + (uid != null));
+                    return;
+                }
             } catch (Throwable t) { android.util.Log.w("fucklark", "档案 Provider 推送失败，回落广播", t); }
             Intent i = new Intent(ACTION_PUSH);
-            i.setPackage("com.chekayo.feishuantirecall");
+            i.setComponent(new android.content.ComponentName(Config.MODULE_PKG,
+                    "com.chekayo.feishuantirecall.ArchiveSync$Receiver"));
             i.putExtra("name", name);
             i.putExtra("data", data);
+            i.putExtra("uid", uid);
             c.sendBroadcast(i);
-        } catch (Throwable ignored) { }
+            Diag.w("档案同步: Provider 未确认，已发送显式副本广播 " + name);
+        } catch (Throwable error) { Diag.w("档案同步失败 " + name + " " + error); }
     }
 
     public static void pushProfiles() { pushToModule("profiles.json"); }
@@ -83,36 +101,13 @@ public final class ArchiveSync {
         pushNotifArchive();
     }
 
-    private static File findLarkFile(String name) {
-        String[] pkgs = {
-                DataViews.PKG,
-                "com.ss.android.lark",
-                "com.larksuite.suite"
-        };
-        String[] uids = { AccountPaths.currentUid, AccountPaths.FALLBACK_UID };
-        for (String pkg : pkgs) {
-            if (pkg == null || pkg.isEmpty()) continue;
-            // v1.8.2+ 按账号隔离: 档案在 accounts/<uid>/resign_tracker/, 存档文本直接在 accounts/<uid>/
-            for (String u : uids) {
-                if (u == null || u.isEmpty()) continue;
-                File f = new File("/data/data/" + pkg + "/files/accounts/" + u + "/resign_tracker/" + name);
-                if (f.exists()) return f;
-                f = new File("/data/user/0/" + pkg + "/files/accounts/" + u + "/resign_tracker/" + name);
-                if (f.exists()) return f;
-                f = new File("/data/data/" + pkg + "/files/accounts/" + u + "/" + name);
-                if (f.exists()) return f;
-                f = new File("/data/user/0/" + pkg + "/files/accounts/" + u + "/" + name);
-                if (f.exists()) return f;
-            }
-            // 旧全局路径兜底(迁移前/迁移失败时)
-            File f = new File("/data/data/" + pkg + "/files/resign_tracker/" + name);
-            if (f.exists()) return f;
-            f = new File("/data/user/0/" + pkg + "/files/resign_tracker/" + name);
-            if (f.exists()) return f;
-            f = new File("/data/data/" + pkg + "/files/" + name);   // notif_archive.txt / leave_log.txt 全局根
-            if (f.exists()) return f;
-        }
-        return null;
+    private static File findLarkFile(Context context, String uid, String name) {
+        String relative = name.endsWith(".json") ? "resign_tracker/" + name : name;
+        File scoped = new File(context.getFilesDir(), "accounts/" + AccountPaths.safeUid(uid) + "/" + relative);
+        if (scoped.isFile()) return scoped;
+        // 旧安装仅有全局文件时沿用兼容副本，不读取其他宿主或账号的目录。
+        File legacy = new File(context.getFilesDir(), relative);
+        return legacy.isFile() ? legacy : null;
     }
 
     /** 模块进程接收档案推送并落盘（manifest 注册）。 */
@@ -123,17 +118,11 @@ public final class ArchiveSync {
                 if (!ACTION_PUSH.equals(intent.getAction())) return;
                 String name = intent.getStringExtra("name");
                 byte[] data = intent.getByteArrayExtra("data");
+                String uid = intent.getStringExtra("uid");
                 if (name == null || data == null || data.length == 0) return;
                 name = name.replace("..", "").replace("/", "_").replace("\\", "_");
                 if (!name.endsWith(".json") && !name.endsWith(".txt")) return;
-                File dir = new File(context.getFilesDir(), "resign_tracker");
-                if (!dir.isDirectory()) dir.mkdirs();
-                // 通知存档放 files 根目录，与其它档案目录区分
-                File out = name.endsWith(".txt")
-                        ? new File(context.getFilesDir(), name)
-                        : new File(dir, name);
-                Config.write(out, new String(data, "UTF-8"));
-                out.setReadable(true, false);
+                ArchiveReplicaStore.save(context.getFilesDir(), uid, name, data);
                 android.util.Log.i("fucklark", "ArchiveSync.recv " + name + " bytes=" + data.length);
             } catch (Throwable t) {
                 android.util.Log.w("fucklark", "ArchiveSync.recv err " + t);

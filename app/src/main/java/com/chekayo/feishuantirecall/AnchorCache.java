@@ -7,7 +7,7 @@ import java.util.Properties;
 
 /** 每个宿主/Android 用户独立存储。缓存只保存方法描述，不保存 ClassLoader 或消息数据。 */
 final class AnchorCache {
-    static final String SCHEMA = "time-footer-2";
+    static final String SCHEMA = "time-footer-3";
     static String identity(Context ctx) throws Exception {
         android.content.pm.PackageInfo info = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
         android.content.pm.ApplicationInfo app = ctx.getApplicationInfo();

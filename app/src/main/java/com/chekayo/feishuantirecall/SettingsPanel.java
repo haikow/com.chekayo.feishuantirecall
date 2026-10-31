@@ -358,7 +358,7 @@ final class SettingsPanel {
 
     // ── 记录页 ──────────────────────────────────────────────────────
     private static void buildRecords(final Context ctx, LinearLayout box, boolean standalone) {
-        // 向飞书请求推送档案/离职名单副本（飞书在运行时约 1s 内到位；本页再次打开可见）
+        // 请求当前副本；人数行在数据到达后自行刷新。
         ArchiveSync.requestPull(ctx);
         box.addView(Ui.section(ctx, "消息记录"));
         LinearLayout c1 = Ui.card(ctx);
@@ -386,17 +386,11 @@ final class SettingsPanel {
 
         box.addView(Ui.section(ctx, "同事档案"));
         LinearLayout c2 = Ui.card(ctx);
-        int rc = DataViews.resignCount();
-        int pc = DataViews.profilesCount();
-        c2.addView(Ui.navRow(ctx, "离职名单",
-                rc >= 0 ? rc + " 人" : "暂无数据", Ui.ACCENT,
-                new View.OnClickListener() {
+        c2.addView(DataViews.archiveCountRow(ctx, true, new View.OnClickListener() {
             @Override public void onClick(View v) { DataViews.showResignedList(ctx); }
         }));
         c2.addView(Ui.dividerRow(ctx));
-        c2.addView(Ui.navRow(ctx, "全员档案",
-                pc >= 0 ? pc + " 人" : "暂无数据", Ui.ACCENT,
-                new View.OnClickListener() {
+        c2.addView(DataViews.archiveCountRow(ctx, false, new View.OnClickListener() {
             @Override public void onClick(View v) { DataViews.showAllProfiles(ctx); }
         }));
         box.addView(c2);

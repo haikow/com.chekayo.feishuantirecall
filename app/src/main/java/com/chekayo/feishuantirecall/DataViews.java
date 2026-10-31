@@ -562,8 +562,10 @@ final class DataViews {
             ArchiveSync.requestRefresh(ctx);
             File rf = archiveFile("resigned_all.json");
             File pf = archiveFile("profiles.json");
-            final JSONObject resigned = rf.exists() ? new JSONObject(Config.read(rf)) : new JSONObject();
+            final String initialRevision = archiveRevision(rf) + "|" + archiveRevision(pf);
             final JSONObject profiles = pf.exists() ? new JSONObject(Config.read(pf)) : new JSONObject();
+            final JSONObject resigned = ResignedArchive.combine(
+                    rf.exists() ? new JSONObject(Config.read(rf)) : new JSONObject(), profiles, System.currentTimeMillis());
             final List<String> ids = new ArrayList<String>();
             Iterator<String> it = resigned.keys();
             while (it.hasNext()) ids.add(it.next());
@@ -614,16 +616,18 @@ final class DataViews {
                 @Override public void onClick(View v) { ArchiveSync.requestRefresh(ctx); }
             });
             final android.os.Handler refreshHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-            final long[] revision = { rf.lastModified(), pf.lastModified() };
+            final String[] revision = { initialRevision };
             final Runnable reload = new Runnable() {
                 @Override public void run() {
                     if (!dialog.isShowing()) return;
                     try {
                         File latest = archiveFile("resigned_all.json");
                         File details = archiveFile("profiles.json");
-                        if (latest.lastModified() != revision[0] || details.lastModified() != revision[1]) {
+                        String nextRevision = archiveRevision(latest) + "|" + archiveRevision(details);
+                        if (!nextRevision.equals(revision[0])) {
                             JSONObject next = latest.exists() ? new JSONObject(Config.read(latest)) : new JSONObject();
                             JSONObject nextProfiles = details.exists() ? new JSONObject(Config.read(details)) : new JSONObject();
+                            next = ResignedArchive.combine(next, nextProfiles, System.currentTimeMillis());
                             idsF.clear();
                             Iterator<String> keys = resignedF.keys();
                             while (keys.hasNext()) { keys.next(); keys.remove(); }
@@ -642,7 +646,7 @@ final class DataViews {
                             populateResigned(ctx, box, idsF, resignedF, profilesF, System.currentTimeMillis() / 1000,
                                     search.getText().toString());
                             dialog.setTitle("离职名单（" + idsF.size() + " 人）");
-                            revision[0] = latest.lastModified(); revision[1] = details.lastModified();
+                            revision[0] = nextRevision;
                         }
                     } catch (Throwable t) { android.util.Log.w("fucklark", "离职名单刷新失败", t); }
                     refreshHandler.postDelayed(this, 2000);
@@ -655,6 +659,10 @@ final class DataViews {
         } catch (Throwable t) {
             android.util.Log.w("FeishuKit", "showResignedList err " + t);
         }
+    }
+
+    private static String archiveRevision(File file) {
+        return file.getAbsolutePath() + ":" + file.lastModified() + ":" + file.length();
     }
 
     /** 按 query 过滤并重建离职行（空 query = 全部）。匹配 姓名/英文名/uid/部门/邮箱/工号/职务/上级。 */
@@ -1101,13 +1109,40 @@ final class DataViews {
         }
     }
 
+    /** 记录页只刷新人数文本；不重建页签、列表和已打开的对话框。 */
+    static View archiveCountRow(final Context ctx, final boolean resigned, View.OnClickListener click) {
+        final View row = Ui.navRow(ctx, resigned ? "离职名单" : "全员档案", "正在读取…", Ui.ACCENT, click);
+        final TextView subtitle = (TextView) ((ViewGroup) ((ViewGroup) row).getChildAt(0)).getChildAt(1);
+        final android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
+        final String[] revision = { null };
+        final Runnable reload = new Runnable() {
+            @Override public void run() {
+                if (!row.isAttachedToWindow()) return;
+                String next = archiveRevision(archiveFile("profiles.json"));
+                if (resigned) next += "|" + archiveRevision(archiveFile("resigned_all.json"));
+                if (!next.equals(revision[0])) {
+                    int count = resigned ? resignCount() : profilesCount();
+                    subtitle.setText(count >= 0 ? count + " 人" : "读取失败，请刷新重试");
+                    revision[0] = next;
+                }
+                handler.postDelayed(this, 2000);
+            }
+        };
+        row.addOnAttachStateChangeListener(new View.OnAttachStateChangeListener() {
+            @Override public void onViewAttachedToWindow(View view) { handler.removeCallbacks(reload); handler.post(reload); }
+            @Override public void onViewDetachedFromWindow(View view) { handler.removeCallbacks(reload); }
+        });
+        return row;
+    }
+
     /** 离职名单人数（读 resigned_all.json 顶层键数）。 */
     static int resignCount() {
         try {
             File f = archiveFile("resigned_all.json");
-            if (!f.exists()) return 0;
-            JSONObject o = new JSONObject(Config.read(f));
-            return o.length();
+            File profiles = archiveFile("profiles.json");
+            JSONObject o = f.isFile() ? new JSONObject(Config.read(f)) : new JSONObject();
+            JSONObject p = profiles.isFile() ? new JSONObject(Config.read(profiles)) : new JSONObject();
+            return ResignedArchive.combine(o, p, System.currentTimeMillis()).length();
         } catch (Throwable t) { return -1; }
     }
 

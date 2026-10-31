@@ -65,17 +65,7 @@ public class ConfigProvider extends ContentProvider {
                 if (!(name.endsWith(".json") || name.endsWith(".txt"))) return null;
                 byte[] data = extras.getByteArray("data");
                 if (data == null) return null;
-                // json → resign_tracker/，txt → files/ 根目录（如 notif_archive.txt）
-                File out;
-                if (name.endsWith(".txt")) {
-                    out = new File(getContext().getFilesDir(), name);
-                } else {
-                    File dir = new File(getContext().getFilesDir(), "resign_tracker");
-                    if (!dir.isDirectory()) dir.mkdirs();
-                    out = new File(dir, name);
-                }
-                Config.write(out, new String(data, "UTF-8"));
-                out.setReadable(true, false);
+                ArchiveReplicaStore.save(getContext().getFilesDir(), extras.getString("uid"), name, data);
                 Bundle b = new Bundle();
                 b.putBoolean("ok", true);
                 return b;

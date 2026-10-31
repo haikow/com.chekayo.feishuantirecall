@@ -54,8 +54,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.8.13";
-    static final int MODULE_VERSION_CODE = 35;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
+    static final String MODULE_VERSION = "1.8.14";
+    static final int MODULE_VERSION_CODE = 36;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
     static final String EXPECTED_SIG = "0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd";
@@ -235,6 +235,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         // pb 类名 com.bytedance.lark.pb.im.v1.UpdateMessagesMeReadRequest 稳定未混淆.
         try { installAntiRead2(lpparam.classLoader); } catch (Throwable t) { alog("antiread2 install failed: " + t); }
         if (PKG.equals(currentProcessName())) ManualReadAction.install(lpparam.classLoader);
+        if (PKG.equals(currentProcessName())) ConversationSwipeRead.install(lpparam.classLoader);
 
         // 7.x and 8.x share the runtime-discovered getter hook; no version-specific mapper.
         RecallMessages.enableDynamicContentRestore();
@@ -727,6 +728,33 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     static final Object MSG2CH_LOCK = new Object();
     static final ThreadLocal<Object[]> KN_SLOT_BACKUP = new ThreadLocal<Object[]>();
     /** 稳定锚点(未混淆): 服务实现类名与框架回调接口; 混淆的 Kn/m 名一律动态发现。 */
+    /** 主动会话已读只复制缓存，服务端确认后按 ID 扣除，保留期间新到的消息。 */
+    static java.util.LinkedHashSet<String> snapshotPendingRead(String chat) {
+        java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<String>();
+        synchronized (PENDING_LOCK) {
+            java.util.Set<String> pending = PENDING_READ.get(chat);
+            if (pending != null) ids.addAll(pending);
+        }
+        synchronized (KN_STATE_LOCK) {
+            KnState state = KN_STATE.get(chat);
+            if (state != null) ids.addAll(state.pendingIds);
+        }
+        return ids;
+    }
+    static void ackPendingRead(String chat, java.util.Set<String> acknowledged) {
+        synchronized (PENDING_LOCK) {
+            java.util.Set<String> pending = PENDING_READ.get(chat);
+            if (pending != null) {
+                pending.removeAll(acknowledged);
+                if (pending.isEmpty()) PENDING_READ.remove(chat);
+            }
+        }
+        synchronized (KN_STATE_LOCK) {
+            KnState state = KN_STATE.get(chat);
+            if (state != null) state.pendingIds.removeAll(acknowledged);
+        }
+    }
+
     static final String IM_MSG_SERVICE_V2 = "com.ss.android.lark.im.sdk.service.ImSdkMessageServiceImplV2";
     static final String KN_CB_CLASS = "com.larksuite.framework.callback.IGetDataCallback";
 
