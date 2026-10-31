@@ -19,6 +19,16 @@ public class LauncherActivity extends Activity {
         @Override public void run() { if (resumed) refreshPage(); }
     };
 
+    private int archivePullAttempt;
+    private final Runnable pullArchives = new Runnable() {
+        @Override public void run() {
+            if (!resumed) return;
+            ArchiveSync.requestPull(LauncherActivity.this);
+            archivePullAttempt++;
+            if (archivePullAttempt < 3) ui.postDelayed(this, archivePullAttempt == 1 ? 2000 : 5000);
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -62,11 +72,16 @@ public class LauncherActivity extends Activity {
         super.onResume();
         resumed = true;
         refreshPage();
+        // 前台已具备接收条件；启动阶段被系统拦截的推送在这里重新拉取。
+        archivePullAttempt = 0;
+        ui.removeCallbacks(pullArchives);
+        ui.post(pullArchives);
     }
 
     @Override protected void onPause() {
         resumed = false;
         ui.removeCallbacks(refresh);
+        ui.removeCallbacks(pullArchives);
         super.onPause();
     }
 
@@ -83,6 +98,7 @@ public class LauncherActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacks(pullArchives);
         if (configReceiver != null) {
             try { unregisterReceiver(configReceiver); } catch (Throwable ignored) { }
             configReceiver = null;

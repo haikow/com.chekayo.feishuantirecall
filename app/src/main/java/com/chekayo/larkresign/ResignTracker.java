@@ -285,29 +285,31 @@ public class ResignTracker {
 
     /** 把本次快照 union 进累计文件 (按 id 去重; 新 id 记 first_seen; 每次刷新 name/last_seen)。返回累计人数。 */
     static int mergeInto(File allFile, File snapFile) {
-        try {
-            JSONArray snap = new JSONArray(readText(snapFile));
-            JSONObject all = allFile.exists() ? new JSONObject(readText(allFile)) : new JSONObject();
-            long now = System.currentTimeMillis();
-            for (int i = 0; i < snap.length(); i++) {
-                JSONObject r = snap.getJSONObject(i);
-                String id = r.optString("id", "");
-                if (id.isEmpty()) continue;
-                JSONObject e = all.optJSONObject(id);
-                if (e == null) { e = new JSONObject(); e.put("first_seen", now); }
-                e.put("id", id);
-                e.put("name", r.optString("name"));
-                e.put("en_us_name", r.optString("en_us_name"));
-                e.put("update_time", r.optString("update_time"));
-                e.put("is_frozen", r.optString("is_frozen"));
-                e.put("last_seen", now);
-                all.put(id, e);
+        synchronized (Config.PROFILES_LOCK) {
+            try {
+                JSONArray snap = new JSONArray(readText(snapFile));
+                JSONObject all = allFile.exists() ? new JSONObject(readText(allFile)) : new JSONObject();
+                long now = System.currentTimeMillis();
+                for (int i = 0; i < snap.length(); i++) {
+                    JSONObject r = snap.getJSONObject(i);
+                    String id = r.optString("id", "");
+                    if (id.isEmpty()) continue;
+                    JSONObject e = all.optJSONObject(id);
+                    if (e == null) { e = new JSONObject(); e.put("first_seen", now); }
+                    e.put("id", id);
+                    e.put("name", r.optString("name"));
+                    e.put("en_us_name", r.optString("en_us_name"));
+                    e.put("update_time", r.optString("update_time"));
+                    e.put("is_frozen", r.optString("is_frozen"));
+                    e.put("last_seen", now);
+                    all.put(id, e);
+                }
+                writeText(allFile, all.toString(1));
+                return all.length();
+            } catch (Throwable t) {
+                com.chekayo.feishuantirecall.ModuleLog.log(TAG + ": merge err " + t);
+                return -1;
             }
-            writeText(allFile, all.toString(1));
-            return all.length();
-        } catch (Throwable t) {
-            com.chekayo.feishuantirecall.ModuleLog.log(TAG + ": merge err " + t);
-            return -1;
         }
     }
 

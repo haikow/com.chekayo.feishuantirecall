@@ -15,14 +15,16 @@ final class MessageTimeDisplay {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<TextView, State> VIEWS = new WeakHashMap<TextView, State>();
     private static boolean changing;
-    private static boolean installed;
+    private static volatile boolean installed;
     private static volatile String installStatus = "未扫描";
     static String status() { return installStatus; }
     private static volatile int timeViewId;
     private static boolean reportedTimeView, reportedBindingError;
-    private static Method timestampMethod;
-    private static Method wrappedMessageMethod;
-    private static Method messageTimestampMethod;
+    private static final Map<Class<?>, Method[]> TIMESTAMPS =
+            new java.util.concurrent.ConcurrentHashMap<Class<?>, Method[]>();
+    private static java.io.File anchorFile;
+    private static String anchorIdentity;
+    private static volatile boolean anchorConfirmed;
     private static final class State {
         long seconds;
         CharSequence original;
@@ -63,6 +65,8 @@ final class MessageTimeDisplay {
             Diag.w("时间锚点: 初始化 pkg=" + context.getPackageName() + " version=" + host.versionName
                     + " code=" + host.versionCode + " process=" + process + " rule=" + AnchorCache.SCHEMA);
             String identity = AnchorCache.identity(context);
+            anchorFile = cache;
+            anchorIdentity = identity;
             Method cached = AnchorCache.load(cache, identity, loader);
             if (cached != null) {
                 try {
@@ -73,23 +77,17 @@ final class MessageTimeDisplay {
                     cached = null;
                 }
             }
+            final java.util.List<Method> bindings;
             if (cached == null) {
                 Diag.w("时间锚点: 开始后台扫描");
                 long scanStart = android.os.SystemClock.elapsedRealtime();
-                java.util.List<Method> scanned = findBindings(loader);
-                Diag.w("时间锚点: 扫描结束 candidates=" + scanned.size() + " elapsedMs="
+                bindings = findBindings(loader);
+                Diag.w("时间锚点: 扫描结束 candidates=" + bindings.size() + " elapsedMs="
                         + (android.os.SystemClock.elapsedRealtime() - scanStart));
-                if (scanned.size() != 1) throw new NoSuchMethodException("时间锚点不唯一");
-                resolveTimestamp(scanned.get(0).getParameterTypes()[1]);
-                AnchorCache.save(cache, identity, scanned.get(0));
-                installStatus = "扫描完成并已保存，重启后加载缓存";
-                Diag.w("时间锚点: " + installStatus);
-                final android.app.Application app = (android.app.Application) context.getApplicationContext();
-                MAIN.post(new Runnable() { public void run() { AnchorRestart.offer(app); } });
-                return;
+                if (bindings.isEmpty()) throw new NoSuchMethodException("没有可用的时间绑定候选");
+            } else {
+                bindings = java.util.Collections.singletonList(cached);
             }
-            final java.util.List<Method> bindings = java.util.Collections.singletonList(cached);
-            resolveTimestamp(bindings.get(0).getParameterTypes()[1]);
             for (final Method binding : bindings) {
                 ViewHookAdapter.hook(binding, new ViewHookAdapter.Callback() {
                     @Override protected void beforeHookedMethod(ViewHookAdapter.Param p) { beforeBind(p.args[0]); }
@@ -107,8 +105,8 @@ final class MessageTimeDisplay {
                 }
             }, int.class);
             installed = true;
-            installStatus = "缓存已加载，等待 time_tv 命中";
-            Diag.w("时间锚点: hook 已安装 " + cached.toGenericString());
+            installStatus = "候选已安装 " + bindings.size() + "，等待 time_tv 验证";
+            Diag.w("时间锚点: hook 已安装 candidates=" + bindings.size());
             ModuleLog.log("[fucklark] 消息时间候选 hook 已安装: " + installStatus);
         } catch (Throwable t) {
             installStatus = "扫描失败: " + t.getClass().getSimpleName() + ": " + t.getMessage();
@@ -138,19 +136,24 @@ final class MessageTimeDisplay {
                     names.add(name);
             }
         }
-        java.util.ArrayList<Method> candidates = new java.util.ArrayList<Method>();
+        java.util.LinkedHashSet<Method> candidates = new java.util.LinkedHashSet<Method>();
         for (String name : names) try {
             Class<?> factory = Class.forName(name, false, loader);
             for (java.lang.reflect.Type contract : factory.getGenericInterfaces()) {
                 if (!(contract instanceof java.lang.reflect.ParameterizedType)) continue;
                 java.lang.reflect.Type[] parameters = ((java.lang.reflect.ParameterizedType) contract).getActualTypeArguments();
-                if (parameters.length != 2 || !(parameters[1] instanceof Class)) continue;
-                Class<?> holder = (Class<?>) parameters[1], block = holder.getEnclosingClass();
+                if (parameters.length != 2) continue;
+                java.lang.reflect.Type holderType = parameters[1];
+                if (holderType instanceof java.lang.reflect.ParameterizedType)
+                    holderType = ((java.lang.reflect.ParameterizedType) holderType).getRawType();
+                if (!(holderType instanceof Class)) continue;
+                Class<?> holder = (Class<?>) holderType, block = holder.getEnclosingClass();
                 if (block == null) continue;
                 int texts = 0;
-                for (Field field : holder.getDeclaredFields())
-                    if (TextView.class.isAssignableFrom(field.getType())) texts++;
-                if (texts < 4) continue;
+                for (Class<?> type = holder; type != null; type = type.getSuperclass())
+                    for (Field field : type.getDeclaredFields())
+                        if (TextView.class.isAssignableFrom(field.getType())) texts++;
+                if (texts == 0) continue;
                 for (Method method : block.getDeclaredMethods()) {
                     Class<?>[] args = method.getParameterTypes(); int flags = method.getModifiers();
                     if (args.length == 2 && args[0] == holder && method.getReturnType() == void.class
@@ -159,12 +162,13 @@ final class MessageTimeDisplay {
                             && hasMessageIdentity(args[1]) && hasTimestamp(args[1])) candidates.add(method);
                 }
             }
-        } catch (Throwable ignored) { }
+        } catch (Throwable error) {
+            Diag.w("时间锚点: 跳过工厂 " + name + " " + error);
+        }
         Diag.w("时间锚点: 工厂扫描完成 factories=" + names.size() + " candidates=" + candidates.size());
         for (Method candidate : candidates) Diag.w("时间锚点: 候选 " + candidate.toGenericString());
-        if (candidates.size() != 1) throw new NoSuchMethodException("Footer 工厂绑定候选=" + candidates.size());
-        candidates.get(0).setAccessible(true);
-        return candidates;
+        for (Method candidate : candidates) candidate.setAccessible(true);
+        return new java.util.ArrayList<Method>(candidates);
     }
 
     private static boolean hasMessageIdentity(Class<?> model) {
@@ -182,38 +186,69 @@ final class MessageTimeDisplay {
         } catch (Throwable ignored) { return false; }
     }
 
+    private static boolean isLongGetter(Method method) {
+        return method.getParameterTypes().length == 0 && method.getReturnType() == long.class
+                && !java.lang.reflect.Modifier.isStatic(method.getModifiers())
+                && !method.isBridge() && !method.isSynthetic();
+    }
+
     private static Method findUniqueLongGetter(Class<?> type) {
         try {
-            Method conventional;
-            try { conventional = type.getMethod("getCreateTime"); }
-            catch (NoSuchMethodException absent) { conventional = type.getMethod("c"); }
-            if (conventional.getParameterTypes().length == 0 && conventional.getReturnType() == long.class)
-                return conventional;
-        } catch (Throwable ignored) { }
+            Method conventional = type.getMethod("getCreateTime");
+            if (isLongGetter(conventional)) return conventional;
+        } catch (NoSuchMethodException ignored) { }
+        // 混淆方法名随宿主构建变化：从消息身份接口唯一的无参 long getter
+        // 反查模型实现，不维护方法名或宿主版本对照表。
+        java.util.LinkedHashSet<Method> contracts = new java.util.LinkedHashSet<Method>();
+        collectTimestampContracts(type, type, contracts, new java.util.HashSet<Class<?>>());
+        if (contracts.size() == 1) return contracts.iterator().next();
+        if (contracts.size() > 1) return null;
         Method found = null;
         for (Method method : type.getMethods()) {
-            if (method.getParameterTypes().length != 0 || method.getReturnType() != long.class
-                    || method.getDeclaringClass() == Object.class) continue;
+            if (!isLongGetter(method) || method.getDeclaringClass() == Object.class) continue;
             if (found != null) return null;
             found = method;
         }
         return found;
     }
 
+    private static void collectTimestampContracts(Class<?> model, Class<?> type,
+            java.util.Set<Method> found, java.util.Set<Class<?>> visited) {
+        if (type == null || !visited.add(type)) return;
+        if (type.isInterface() && hasMessageIdentity(type)) {
+            Method unique = null;
+            int count = 0;
+            for (Method method : type.getMethods()) {
+                if (isLongGetter(method)) { unique = method; count++; }
+            }
+            if (count == 1) try {
+                found.add(model.getMethod(unique.getName()));
+            } catch (NoSuchMethodException ignored) { }
+        }
+        for (Class<?> contract : type.getInterfaces())
+            collectTimestampContracts(model, contract, found, visited);
+        collectTimestampContracts(model, type.getSuperclass(), found, visited);
+    }
+
     private static void resolveTimestamp(Class<?> model) throws NoSuchMethodException {
-        wrappedMessageMethod = null;
-        messageTimestampMethod = null;
-        timestampMethod = findUniqueLongGetter(model);
-        if (timestampMethod != null) return;
-        wrappedMessageMethod = model.getMethod("getMessage");
-        messageTimestampMethod = findUniqueLongGetter(wrappedMessageMethod.getReturnType());
+        if (TIMESTAMPS.containsKey(model)) return;
+        Method direct = findUniqueLongGetter(model);
+        if (direct != null) {
+            Diag.w("时间锚点: 消息时间 getter " + direct.toGenericString());
+            TIMESTAMPS.put(model, new Method[] { null, direct });
+            return;
+        }
+        Method wrappedMessageMethod = model.getMethod("getMessage");
+        Method messageTimestampMethod = findUniqueLongGetter(wrappedMessageMethod.getReturnType());
         if (messageTimestampMethod == null) throw new NoSuchMethodException("消息时间 getter 不唯一");
+        TIMESTAMPS.put(model, new Method[] { wrappedMessageMethod, messageTimestampMethod });
     }
 
     private static long timestamp(Object model) throws Throwable {
-        Object owner = wrappedMessageMethod == null ? model : wrappedMessageMethod.invoke(model);
-        Method getter = wrappedMessageMethod == null ? timestampMethod : messageTimestampMethod;
-        return ((Number) getter.invoke(owner)).longValue();
+        resolveTimestamp(model.getClass());
+        Method[] accessors = TIMESTAMPS.get(model.getClass());
+        Object owner = accessors[0] == null ? model : accessors[0].invoke(model);
+        return ((Number) accessors[1].invoke(owner)).longValue();
     }
 
     private static TextView findTime(Object holder) {
@@ -222,7 +257,7 @@ final class MessageTimeDisplay {
         int id = timeViewId;
         if (id != 0) {
             View cached = root.findViewById(id);
-            return cached instanceof TextView ? (TextView) cached : null;
+            if (cached instanceof TextView) return (TextView) cached;
         }
         if (!(root instanceof android.view.ViewGroup)) return null;
         java.util.ArrayDeque<View> pending = new java.util.ArrayDeque<View>();
@@ -274,11 +309,9 @@ final class MessageTimeDisplay {
         try {
             TextView tv = findTime(holder);
             if (tv == null) return;
-            // 只在首次初始化时解析 timestamp 方法，不在每次绑定时重复解析
-            if (timestampMethod == null && wrappedMessageMethod == null) {
-                resolveTimestamp(model.getClass());
-            }
             long seconds = timestamp(model);
+            if (seconds <= 0) return;
+            confirmAnchor(binding);
             State state = new State(seconds, tv);
             VIEWS.put(tv, state);
             apply(tv, state);
@@ -294,6 +327,23 @@ final class MessageTimeDisplay {
                 Diag.w("时间锚点: 首次绑定失败 " + t);
             }
         }
+    }
+
+    /** 只有实际找到 time_tv 并成功读取消息时间，才发布映射。磁盘写入留在后台。 */
+    private static synchronized void confirmAnchor(final Method binding) {
+        if (anchorConfirmed || anchorFile == null || anchorIdentity == null) return;
+        anchorConfirmed = true;
+        Thread writer = new Thread(new Runnable() {
+            @Override public void run() {
+                try { AnchorCache.save(anchorFile, anchorIdentity, binding); }
+                catch (Throwable error) {
+                    anchorConfirmed = false;
+                    Diag.w("时间锚点: 保存已验证映射失败 " + error);
+                }
+            }
+        }, "message-time-cache");
+        writer.setDaemon(true);
+        writer.start();
     }
 
     private static CharSequence nativeText(State state) {

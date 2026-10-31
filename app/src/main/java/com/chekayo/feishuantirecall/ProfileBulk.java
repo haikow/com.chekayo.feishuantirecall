@@ -65,8 +65,8 @@ public class ProfileBulk {
             if (uid.isEmpty()) continue;
             byte[] blob;
             try { blob = hex(row.optString("hex", "")); } catch (Throwable t) { continue; }
-            if (blob == null || blob.length == 0) continue;
-
+            // 离职后宿主可能清空富资料；状态和姓名仍须更新，历史明细由 merge 保留。
+            if (blob == null) blob = new byte[0];
             HashMap<String, String> sec = new HashMap<String, String>();
             collectSections(blob, sec);
             String company = companyName(blob);
@@ -116,9 +116,11 @@ public class ProfileBulk {
                 all.put(uid, rec);
             }
             writeAtomic(profilesJson, all.toString(1));
+            ResignedArchive.update(profilesJson, all);
         }
         // 归档后推副本到模块进程，桌面「同事记录」才能读到
         ArchiveSync.pushProfiles();
+        ArchiveSync.pushResigned();
         return updates.size();
     }
 
@@ -221,9 +223,11 @@ public class ProfileBulk {
                 all.put(uid, rec);
             }
             writeAtomic(profilesJson, all.toString(1));
+            ResignedArchive.update(profilesJson, all);
         }
         // 归档后推副本到模块进程，桌面「同事记录」才能读到
         ArchiveSync.pushProfiles();
+        ArchiveSync.pushResigned();
         return updates.size();
     }
 

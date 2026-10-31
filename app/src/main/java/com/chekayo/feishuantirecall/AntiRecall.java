@@ -52,8 +52,8 @@ public class AntiRecall {
         g_lark_mark = 0;
         return false;
     }
-    static final String MODULE_VERSION = "1.8.13-api102";
-    static final int MODULE_VERSION_CODE = 1035;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
+    static final String MODULE_VERSION = "1.8.14-api102";
+    static final int MODULE_VERSION_CODE = 1036;   // 与 AndroidManifest versionCode 同步; 更新检查比对用
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
     static final String EXPECTED_SIG = "0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd";
@@ -245,6 +245,7 @@ public class AntiRecall {
         // 单条消息标记已读功能
         if (PKG.equals(currentProcessName())) {
             try { ManualReadAction.install(classLoader); } catch (Throwable t) { alog("manual read action install failed: " + t); }
+            ConversationSwipeRead.install(classLoader);
         }
 
         // ---- 2) Java 消息模型动态兜底（7.x/8.x 共用，无版本 mapper 名称分支） ----
@@ -765,6 +766,30 @@ public class AntiRecall {
             new java.util.concurrent.ConcurrentHashMap<String, java.util.LinkedHashSet<String>>();
 
     /** v2.4 稳定锚点: 服务实现类名(未混淆)与框架回调接口(未混淆); 混淆的 Kn/m 名一律动态发现。 */
+    /** compute 与自动浏览/回复使用相同的逐会话锁，避免读取或消费可变集合时竞争。 */
+    static java.util.LinkedHashSet<String> snapshotPendingRead(String chat) {
+        final java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<String>();
+        PENDING_READ.computeIfPresent(chat, new java.util.function.BiFunction<String, java.util.LinkedHashSet<String>, java.util.LinkedHashSet<String>>() {
+            @Override public java.util.LinkedHashSet<String> apply(String key, java.util.LinkedHashSet<String> value) {
+                ids.addAll(value); return value;
+            }
+        });
+        KN_STATE.computeIfPresent(chat, new java.util.function.BiFunction<String, KnState, KnState>() {
+            @Override public KnState apply(String key, KnState value) { ids.addAll(value.pendingIds); return value; }
+        });
+        return ids;
+    }
+    static void ackPendingRead(String chat, final java.util.Set<String> acknowledged) {
+        PENDING_READ.computeIfPresent(chat, new java.util.function.BiFunction<String, java.util.LinkedHashSet<String>, java.util.LinkedHashSet<String>>() {
+            @Override public java.util.LinkedHashSet<String> apply(String key, java.util.LinkedHashSet<String> value) {
+                value.removeAll(acknowledged); return value.isEmpty() ? null : value;
+            }
+        });
+        KN_STATE.computeIfPresent(chat, new java.util.function.BiFunction<String, KnState, KnState>() {
+            @Override public KnState apply(String key, KnState value) { value.pendingIds.removeAll(acknowledged); return value; }
+        });
+    }
+
     static final String IM_MSG_SERVICE_V2 = "com.ss.android.lark.im.sdk.service.ImSdkMessageServiceImplV2";
     static final String KN_CB_CLASS = "com.larksuite.framework.callback.IGetDataCallback";
     /** 按会话累加的截获 ids(上次回复以来的并集, 上限500); ctx 按会话存重放模板 {impl, m, cb, ids样本}。 */

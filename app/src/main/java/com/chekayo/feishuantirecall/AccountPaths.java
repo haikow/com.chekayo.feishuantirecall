@@ -38,6 +38,14 @@ public final class AccountPaths {
 
     /** 探测当前飞书账号 uid。 */
     public static String detectUid(Context ctx) {
+        // 模块进程没有宿主数据库，使用最后一次成功接收副本的明确账号。
+        if (ctx != null && Config.MODULE_PKG.equals(ctx.getPackageName())) {
+            try {
+                String uid = Config.read(new File(ctx.getFilesDir(), "archive_active_uid.txt")).trim();
+                if (uid.matches("[A-Za-z0-9_-]+") && !FALLBACK_UID.equals(uid)) return uid;
+            } catch (Exception ignored) { }
+            return currentUid == null || currentUid.isEmpty() ? FALLBACK_UID : currentUid;
+        }
         // 1) contact.db 路径：databases/sdk_storage/<uid>/contact.db
         try {
             File data = null;
