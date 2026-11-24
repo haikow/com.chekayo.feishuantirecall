@@ -7,6 +7,7 @@ import android.graphics.Color;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -19,6 +20,10 @@ import android.widget.Toast;
  * 视觉规范见 {@link Ui}。
  */
 final class SettingsPanel {
+    interface TabChangedListener {
+        void onTabChanged(int index);
+    }
+
     private SettingsPanel() { }
 
     /** 在飞书进程内以 AlertDialog 弹出完整面板（打开前刷新当前账号，保证档案/消息路径正确）。 */
@@ -27,14 +32,12 @@ final class SettingsPanel {
         try { AccountPaths.bind(ctx, null); } catch (Throwable ignored) { }
         Config.loadAndAnnounce();
         final boolean tampered = readTampered();
-        final LinearLayout root = buildRoot(ctx, /*standalone=*/false, tampered);
-        root.setBackgroundColor(android.graphics.Color.TRANSPARENT);
-        AlertDialog dialog = new AlertDialog.Builder(ctx)
+        final LinearLayout root = buildRoot(ctx, /*standalone=*/false, tampered, 0, null);
+        root.setBackgroundColor(Color.TRANSPARENT);
+        Ui.showDialog(new AlertDialog.Builder(ctx)
                 .setTitle("模块设置")
                 .setView(root)
-                .setPositiveButton("完成", null)
-                .show();
-        Ui.styleDialog(dialog);
+                .setPositiveButton("完成", null));
         // 首次打开：仅静默查更新；赞赏改为工具页手动入口，不自动弹窗
         if (!DataViews.updateCheckedThisSession) {
             DataViews.updateCheckedThisSession = true;
@@ -44,15 +47,22 @@ final class SettingsPanel {
 
     /** 模块桌面入口：作为 Activity 内容的完整页面（非对话框）。 */
     static View buildStandalonePage(Context ctx) {
+        return buildStandalonePage(ctx, 0, null);
+    }
+
+    /** 模块桌面入口（支持记住当前页签）。 */
+    static View buildStandalonePage(Context ctx, int initialTab, TabChangedListener listener) {
         try { Config.setFilesDir(ctx.getFilesDir()); } catch (Throwable ignored) { }
         // 桌面进程探测不到飞书账号时保持 unknown，读档案会回落旧路径/模块副本
         try { if (AccountPaths.currentUid == null || AccountPaths.currentUid.isEmpty()) AccountPaths.bind(ctx, null); } catch (Throwable ignored) { }
         Config.loadAndAnnounce();
-        return buildRoot(ctx, /*standalone=*/true, /*tampered=*/false);
+        return buildRoot(ctx, /*standalone=*/true, /*tampered=*/false, initialTab, listener);
     }
 
     // ── 根布局：内容区（weight=1）+ 底部页签 ─────────────────────────
-    private static LinearLayout buildRoot(final Context ctx, final boolean standalone, final boolean tampered) {
+    private static LinearLayout buildRoot(final Context ctx, final boolean standalone,
+                                          final boolean tampered, int initialTab,
+                                          final TabChangedListener listener) {
         final LinearLayout root = Ui.page(ctx);
         root.setPadding(0, 0, 0, 0);
 
@@ -64,12 +74,20 @@ final class SettingsPanel {
         root.addView(page, new LinearLayout.LayoutParams(-1, 0, 1f));
 
         final String[] names = { "核心", "记录", "工具", "关于" };
-        final TextView[] tabs = new TextView[4];
+        final int safeInitial = (initialTab >= 0 && initialTab < names.length) ? initialTab : 0;
+        final int[] currentTab = { safeInitial };
+        final TextView[] tabs = new TextView[names.length];
         LinearLayout bar = new LinearLayout(ctx);
         bar.setOrientation(LinearLayout.HORIZONTAL);
         bar.setBackground(Ui.glass(ctx, 24, true));
         bar.setElevation(Ui.dp(ctx, 5));
         bar.setPadding(0, Ui.dp(ctx, 2), 0, Ui.dp(ctx, 2));
+
+        final Runnable refreshCurrentTab = new Runnable() {
+            @Override public void run() {
+                switchTab(ctx, page, currentTab[0], standalone, tampered, tabs, this);
+            }
+        };
 
         for (int i = 0; i < names.length; i++) {
             final int index = i;
@@ -82,7 +100,9 @@ final class SettingsPanel {
             bar.addView(tab, new LinearLayout.LayoutParams(0, -2, 1f));
             tab.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
-                    switchTab(ctx, page, index, standalone, tampered, tabs);
+                    currentTab[0] = index;
+                    if (listener != null) listener.onTabChanged(index);
+                    switchTab(ctx, page, index, standalone, tampered, tabs, refreshCurrentTab);
                 }
             });
         }
@@ -91,12 +111,13 @@ final class SettingsPanel {
         barParams.setMargins(Ui.dp(ctx, 12), Ui.dp(ctx, 8), Ui.dp(ctx, 12), Ui.dp(ctx, 12));
         root.addView(bar, barParams);
 
-        switchTab(ctx, page, 0, standalone, tampered, tabs);
+        switchTab(ctx, page, safeInitial, standalone, tampered, tabs, refreshCurrentTab);
         return root;
     }
 
     private static void switchTab(Context ctx, LinearLayout page, int index,
-                                  boolean standalone, boolean tampered, TextView[] tabs) {
+                                  boolean standalone, boolean tampered, TextView[] tabs,
+                                  Runnable onRefresh) {
         page.removeAllViews();
         ScrollView sv = new ScrollView(ctx);
         sv.setFillViewport(true);
@@ -105,7 +126,7 @@ final class SettingsPanel {
         box.setPadding(Ui.dp(ctx, 12), Ui.dp(ctx, 4), Ui.dp(ctx, 12), Ui.dp(ctx, 8));
         if (index == 0) buildCore(ctx, box, standalone, tampered);
         else if (index == 1) buildRecords(ctx, box, standalone);
-        else if (index == 2) buildTools(ctx, box, standalone, tampered);
+        else if (index == 2) buildTools(ctx, box, standalone, tampered, onRefresh);
         else buildAbout(ctx, box, tampered);
         sv.addView(box);
         page.addView(sv, new LinearLayout.LayoutParams(-1, -1));
@@ -117,13 +138,29 @@ final class SettingsPanel {
         }
     }
 
+    private static TextView rowTitle(View row) {
+        if (!(row instanceof ViewGroup)) return null;
+        View first = ((ViewGroup) row).getChildAt(0);
+        if (!(first instanceof ViewGroup) || ((ViewGroup) first).getChildCount() < 1) return null;
+        View tv = ((ViewGroup) first).getChildAt(0);
+        return tv instanceof TextView ? (TextView) tv : null;
+    }
+
+    private static TextView rowSubtitle(View row) {
+        if (!(row instanceof ViewGroup)) return null;
+        View first = ((ViewGroup) row).getChildAt(0);
+        if (!(first instanceof ViewGroup) || ((ViewGroup) first).getChildCount() < 2) return null;
+        View tv = ((ViewGroup) first).getChildAt(1);
+        return tv instanceof TextView ? (TextView) tv : null;
+    }
+
     // ── 核心页 ──────────────────────────────────────────────────────
-    private static void buildCore(Context ctx, LinearLayout box, boolean standalone, boolean tampered) {
+    private static void buildCore(final Context ctx, LinearLayout box, boolean standalone, boolean tampered) {
         if (tampered) {
             TextView warn = new TextView(ctx);
-            warn.setText("⚠ 本模块签名异常，疑似被篡改/重打包，核心功能已禁用。\n请从作者官方渠道重新下载安装。");
+            warn.setText("ℹ 当前为非官方签名构建（自编译或重打包），核心功能仍可正常使用，赞赏入口已隐藏。如需官方版本请从 GitHub Release 下载。");
             warn.setTextSize(13);
-            warn.setTextColor(Ui.DANGER);
+            warn.setTextColor(Ui.WARNING);
             int p = Ui.dp(ctx, 14);
             warn.setPadding(p, p, p, p);
             LinearLayout card = Ui.card(ctx);
@@ -134,40 +171,79 @@ final class SettingsPanel {
         // ── 消息与隐私 ──
         box.addView(Ui.section(ctx, "消息与隐私"));
         LinearLayout c1 = Ui.card(ctx);
+
+        final Runnable[] syncRecallHolder = new Runnable[1];
+
         c1.addView(Ui.switchRow(ctx, "防撤回", "保留他人撤回的原文；自己的消息正常撤回",
                 Config.antirecall, new Ui.OnToggle() {
             @Override public void on(boolean b) {
                 Config.set("antirecall", b);
                 try { AntiRecall.nativeSetRecall(b); } catch (Throwable ignored) { }
+                if (syncRecallHolder[0] != null) syncRecallHolder[0].run();
             }
         }));
         // ── 防撤回展示选项 ──
         c1.addView(Ui.dividerRow(ctx));
-        c1.addView(Ui.switchRow(ctx, "撤回标识", "保留原消息，按所选模式显示撤回提示或颜色标识",
+        final View recallHintRow = Ui.switchRow(ctx, "撤回标识", "保留原消息，按所选模式显示撤回提示或颜色标识",
                 Config.showRecallHint, new Ui.OnToggle() {
-            @Override public void on(boolean b) { Config.set("showRecallHint", b); }
-        }));
+            @Override public void on(boolean b) {
+                Config.set("showRecallHint", b);
+                if (syncRecallHolder[0] != null) syncRecallHolder[0].run();
+            }
+        });
+        c1.addView(recallHintRow);
         c1.addView(Ui.dividerRow(ctx));
-        c1.addView(Ui.navRow(ctx, "撤回显示模式",
+        final View recallModeRow = Ui.navRow(ctx, "撤回显示模式",
                 Config.recallDisplayMode == Config.RECALL_MODE_HINT ? "保留原文，仅显示撤回提示" : "保留原文并用气泡颜色标识",
                 Ui.ACCENT, new View.OnClickListener() {
-            @Override public void onClick(View v) { showRecallDisplayMode(ctx, (android.widget.LinearLayout) v); }
-        }));
+            @Override public void onClick(View v) {
+                showRecallDisplayMode(ctx, (LinearLayout) v, syncRecallHolder[0]);
+            }
+        });
+        c1.addView(recallModeRow);
         c1.addView(Ui.dividerRow(ctx));
-        c1.addView(recallBorderColorRow(ctx));
+        final View recallColorRow = recallBorderColorRow(ctx);
+        c1.addView(recallColorRow);
         c1.addView(Ui.dividerRow(ctx));
-        c1.addView(Ui.navRow(ctx, "未保留原文时的提示文案",
-                "当前：" + Config.recallHintText, Ui.ACCENT,
-                new View.OnClickListener() {
-            @Override public void onClick(View v) { showRecallHintTextEditor(ctx); }
-        }));
+        final View recallHintTextRow = Ui.navRow(ctx,
+                Config.recallDisplayMode == Config.RECALL_MODE_COLOR
+                        ? "兜底撤回提示文案（未保留原文时）" : "撤回提示文案",
+                "当前：" + Config.recallHintText, Ui.ACCENT, null);
+        final TextView recallHintTextTitle = rowTitle(recallHintTextRow);
+        final TextView recallHintTextSub = rowSubtitle(recallHintTextRow);
+        recallHintTextRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                showRecallHintTextEditor(ctx, recallHintTextSub);
+            }
+        });
+        recallHintTextRow.setClickable(true);
+        c1.addView(recallHintTextRow);
+
+        syncRecallHolder[0] = new Runnable() {
+            @Override public void run() {
+                boolean antiOn = Config.antirecall;
+                boolean hintOn = antiOn && Config.showRecallHint;
+                boolean colorOn = hintOn && Config.recallDisplayMode == Config.RECALL_MODE_COLOR;
+                Ui.setRowEnabled(recallHintRow, antiOn);
+                Ui.setRowEnabled(recallModeRow, hintOn);
+                Ui.setRowEnabled(recallColorRow, colorOn);
+                Ui.setRowEnabled(recallHintTextRow, hintOn);
+                if (recallHintTextTitle != null) {
+                    recallHintTextTitle.setText(Config.recallDisplayMode == Config.RECALL_MODE_COLOR
+                            ? "兜底撤回提示文案（未保留原文时）" : "撤回提示文案");
+                }
+            }
+        };
+        syncRecallHolder[0].run();
+
         c1.addView(Ui.dividerRow(ctx));
         c1.addView(Ui.switchRow(ctx, "防对方已读", "只看不回＝未读，回复后才标记已读",
                 Config.antiread, new Ui.OnToggle() {
             @Override public void on(boolean b) { Config.set("antiread", b); }
         }));
         c1.addView(Ui.dividerRow(ctx));
-        c1.addView(Ui.switchRow(ctx, "后台消息存档", "存档并在聊天里还原后台被撤回的消息（需开消息预览）",
+        c1.addView(Ui.switchRow(ctx, "后台消息存档",
+                "从系统通知留底后台被撤回的消息，可在「记录」查看（需开消息预览）",
                 Config.notifarchive, new Ui.OnToggle() {
             @Override public void on(boolean b) { Config.set("notifarchive", b); }
         }));
@@ -189,15 +265,24 @@ final class SettingsPanel {
             @Override public void on(boolean b) { Config.set("messageTimeAlways", b); }
         }));
         c1.addView(Ui.dividerRow(ctx));
+        final View[] timeFormatRowHolder = new View[1];
         c1.addView(Ui.switchRow(ctx, "时间格式化", "独立于常驻开关，点击显示时间时也使用自定义格式",
                 Config.messageTimeFormatting, new Ui.OnToggle() {
-            @Override public void on(boolean b) { Config.set("messageTimeFormatting", b); }
+            @Override public void on(boolean b) {
+                Config.set("messageTimeFormatting", b);
+                Ui.setRowEnabled(timeFormatRowHolder[0], b);
+            }
         }));
         c1.addView(Ui.dividerRow(ctx));
-        c1.addView(Ui.navRow(ctx, "消息时间格式", Config.messageTimePattern, Ui.ACCENT,
-                new View.OnClickListener() {
-            @Override public void onClick(View v) { showMessageTimeFormat(ctx); }
-        }));
+        final View timeFormatRow = Ui.navRow(ctx, "消息时间格式", Config.messageTimePattern, Ui.ACCENT, null);
+        final TextView timeFormatSub = rowSubtitle(timeFormatRow);
+        timeFormatRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { showMessageTimeFormat(ctx, timeFormatSub); }
+        });
+        timeFormatRow.setClickable(true);
+        timeFormatRowHolder[0] = timeFormatRow;
+        Ui.setRowEnabled(timeFormatRow, Config.messageTimeFormatting);
+        c1.addView(timeFormatRow);
         c1.addView(Ui.dividerRow(ctx));
         c1.addView(Ui.switchRow(ctx, "移除聊天水印", "去掉外部联系人聊天里的平铺水印，改后重进聊天生效",
                 Config.dewatermark, new Ui.OnToggle() {
@@ -249,12 +334,12 @@ final class SettingsPanel {
         c4.addView(Ui.dividerRow(ctx));
 
         final boolean walkerOn = walkerBound(ctx);
-        c4.addView(Ui.switchRow(ctx, "组织架构自动巡游",
+        c4.addView(Ui.navRow(ctx, "组织架构自动巡游",
                 walkerOn
-                        ? "已开启：进【通讯录→组织内联系人】即自动巡游"
-                        : "未开启：拨动后到系统无障碍打开「组织巡游」",
-                walkerOn, new Ui.OnToggle() {
-            @Override public void on(boolean b) {
+                        ? "已开启 · 点击管理无障碍权限"
+                        : "未开启 · 点击前往系统无障碍开启",
+                walkerOn ? Ui.SUCCESS : Ui.ACCENT, new View.OnClickListener() {
+            @Override public void onClick(View v) {
                 try {
                     Intent i = new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS);
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
@@ -308,12 +393,17 @@ final class SettingsPanel {
                 + (standalone ? "  ·  模块桌面入口" : "")));
     }
 
-    private static void showMessageTimeFormat(final Context ctx) {
-        final android.widget.EditText input = new android.widget.EditText(ctx);
-        input.setSingleLine(true); input.setText(Config.messageTimePattern);
-        int pad = Ui.dp(ctx, 16); input.setPadding(pad, pad, pad, pad);
+    private static void showMessageTimeFormat(final Context ctx, final TextView subtitleView) {
+        final EditText input = new EditText(ctx);
+        input.setSingleLine(true);
+        input.setText(Config.messageTimePattern);
+        input.setTextColor(Ui.titleColor(ctx));
+        input.setHintTextColor(Ui.muteColor(ctx));
+        int pad = Ui.dp(ctx, 16);
+        input.setPadding(pad, pad, pad, pad);
         final TextView preview = new TextView(ctx);
-        preview.setTextColor(Ui.subColor(ctx)); preview.setPadding(pad, 0, pad, pad);
+        preview.setTextColor(Ui.subColor(ctx));
+        preview.setPadding(pad, 0, pad, pad);
         final Runnable update = new Runnable() {
             @Override public void run() {
                 String pattern = input.getText().toString();
@@ -328,27 +418,30 @@ final class SettingsPanel {
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) { update.run(); }
             @Override public void afterTextChanged(android.text.Editable e) {}
         });
-        LinearLayout box = new LinearLayout(ctx); box.setOrientation(LinearLayout.VERTICAL);
-        box.addView(input); box.addView(preview);
+        LinearLayout box = new LinearLayout(ctx);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.addView(input);
+        box.addView(preview);
         box.addView(Ui.navRow(ctx, "选择常用格式", "相对日期、完整日期、仅时间", Ui.ACCENT, new View.OnClickListener() {
             @Override public void onClick(View v) {
                 final String[] patterns = { "{relative} HH:mm:ss", "{relative} HH:mm", "yyyy-MM-dd HH:mm:ss", "MM-dd HH:mm", "HH:mm:ss" };
-                new AlertDialog.Builder(ctx).setTitle("常用时间格式")
+                Ui.showDialog(new AlertDialog.Builder(ctx).setTitle("常用时间格式")
                         .setItems(patterns, new android.content.DialogInterface.OnClickListener() {
                     @Override public void onClick(android.content.DialogInterface d, int which) { input.setText(patterns[which]); }
-                }).show();
+                }));
             }
         }));
         update.run();
-        final AlertDialog dialog = new AlertDialog.Builder(ctx).setTitle("消息时间格式")
+        final AlertDialog dialog = Ui.showDialog(new AlertDialog.Builder(ctx).setTitle("消息时间格式")
                 .setView(box).setPositiveButton("保存", null).setNegativeButton("取消", null)
-                .setNeutralButton("恢复默认", null).show();
-        Ui.styleDialog(dialog);
+                .setNeutralButton("恢复默认", null));
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 String pattern = input.getText().toString().trim();
                 if (!MessageTimeFormat.valid(pattern)) { input.setError("时间格式无效"); return; }
-                Config.setStr("messageTimePattern", pattern); dialog.dismiss();
+                Config.setStr("messageTimePattern", pattern);
+                if (subtitleView != null) subtitleView.setText(Config.messageTimePattern);
+                dialog.dismiss();
             }
         });
         dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
@@ -409,7 +502,8 @@ final class SettingsPanel {
 
     // ── 工具页 ──────────────────────────────────────────────────────
     private static void buildTools(final Context ctx, LinearLayout box,
-                                   final boolean standalone, final boolean tampered) {
+                                   final boolean standalone, final boolean tampered,
+                                   final Runnable onRefresh) {
         // 数据迁移
         box.addView(Ui.section(ctx, "数据"));
         LinearLayout c1 = Ui.card(ctx);
@@ -424,7 +518,7 @@ final class SettingsPanel {
         c1.addView(Ui.navRow(ctx, "从备份恢复", "用备份覆盖当前同名数据", Ui.WARNING,
                 new View.OnClickListener() {
             @Override public void onClick(View v) {
-                new AlertDialog.Builder(ctx)
+                Ui.showDialog(new AlertDialog.Builder(ctx)
                         .setTitle("恢复模块数据")
                         .setMessage("将用备份中的配置和档案覆盖当前同名数据。恢复完成后建议重启飞书。")
                         .setNegativeButton("取消", null)
@@ -433,7 +527,7 @@ final class SettingsPanel {
                                 try { DataMigration.chooseImport(ctx); }
                                 catch (Throwable t) { Toast.makeText(ctx, "恢复失败: " + t, Toast.LENGTH_LONG).show(); }
                             }
-                        }).show();
+                        }));
             }
         }));
         c1.addView(Ui.dividerRow(ctx));
@@ -457,11 +551,18 @@ final class SettingsPanel {
                 try {
                     android.content.ClipboardManager cm = (android.content.ClipboardManager)
                             ctx.getSystemService(Context.CLIPBOARD_SERVICE);
-                    if (cm.getPrimaryClip() == null || cm.getPrimaryClip().getItemCount() == 0)
-                        throw new IllegalArgumentException("empty");
+                    if (cm == null || cm.getPrimaryClip() == null || cm.getPrimaryClip().getItemCount() == 0) {
+                        Toast.makeText(ctx, "导入失败：剪贴板无有效 JSON", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
                     CharSequence text = cm.getPrimaryClip().getItemAt(0).coerceToText(ctx);
-                    Config.applySnapshot(text.toString());
-                    Toast.makeText(ctx, "配置已导入", Toast.LENGTH_SHORT).show();
+                    boolean ok = text != null && Config.applyImportedSnapshot(text.toString());
+                    if (ok) {
+                        Toast.makeText(ctx, "配置已导入", Toast.LENGTH_SHORT).show();
+                        if (onRefresh != null) onRefresh.run();
+                    } else {
+                        Toast.makeText(ctx, "导入失败：剪贴板无有效 JSON", Toast.LENGTH_SHORT).show();
+                    }
                 } catch (Throwable t) {
                     Toast.makeText(ctx, "导入失败：剪贴板无有效 JSON", Toast.LENGTH_SHORT).show();
                 }
@@ -502,7 +603,7 @@ final class SettingsPanel {
             c2.addView(Ui.navRow(ctx, "隐藏桌面图标", "隐藏后可在系统设置的应用列表中恢复",
                     Ui.muteColor(ctx), new View.OnClickListener() {
                 @Override public void onClick(View v) {
-                    new AlertDialog.Builder(ctx)
+                    Ui.showDialog(new AlertDialog.Builder(ctx)
                             .setTitle("隐藏桌面图标")
                             .setMessage("隐藏后桌面不再显示图标；LSPosed 模块详情里的「启动/设置」也会一并失效。\n\n需要恢复时：系统设置 → 应用 → FeishuKit → 启用，或在应用详情里手动启用主入口。")
                             .setNegativeButton("取消", null)
@@ -519,12 +620,11 @@ final class SettingsPanel {
                                         Toast.makeText(ctx, "操作失败: " + t, Toast.LENGTH_SHORT).show();
                                     }
                                 }
-                            }).show();
+                            }));
                 }
             }));
         }
         box.addView(c2);
-
     }
 
     private static void buildAbout(final Context ctx, LinearLayout box, boolean tampered) {
@@ -575,7 +675,8 @@ final class SettingsPanel {
     private static void addContributor(final Context ctx, LinearLayout parent, final String user,
                                        String contribution, String initial) {
         LinearLayout row = new LinearLayout(ctx);
-        row.setGravity(Gravity.CENTER_VERTICAL); row.setPadding(Ui.dp(ctx, 12), Ui.dp(ctx, 10), Ui.dp(ctx, 12), Ui.dp(ctx, 10));
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(Ui.dp(ctx, 12), Ui.dp(ctx, 10), Ui.dp(ctx, 12), Ui.dp(ctx, 10));
         row.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
             DataViews.openUrl(ctx, "https://github.com/" + user);
         }});
@@ -637,31 +738,42 @@ final class SettingsPanel {
 
         box.addView(Ui.section(ctx, "下载另存"));
         LinearLayout c3 = Ui.card(ctx);
+        final View[] subdirRowHolder = new View[1];
         c3.addView(Ui.switchRow(ctx, "另存到系统「下载」", "复制一份到公共 Download 目录",
                 Config.pubdownload, new Ui.OnToggle() {
-            @Override public void on(boolean b) { Config.set("pubdownload", b); }
+            @Override public void on(boolean b) {
+                Config.set("pubdownload", b);
+                Ui.setRowEnabled(subdirRowHolder[0], b);
+            }
         }));
         c3.addView(Ui.dividerRow(ctx));
-        View sub = Ui.navRow(ctx, "保存子目录", subdirDisplay(), Ui.ACCENT, new View.OnClickListener() {
+        final View sub = Ui.navRow(ctx, "保存子目录", subdirDisplay(), Ui.ACCENT, null);
+        final TextView subSubtitle = rowSubtitle(sub);
+        sub.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                final android.widget.EditText et = new android.widget.EditText(ctx);
+                final EditText et = new EditText(ctx);
                 et.setHint("留空 = Download 根目录；如：Lark");
                 et.setText(Config.pubdownloadSubdir);
+                et.setTextColor(Ui.titleColor(ctx));
+                et.setHintTextColor(Ui.muteColor(ctx));
                 int pad = Ui.dp(ctx, 16);
                 et.setPadding(pad, pad, pad, pad);
-                new AlertDialog.Builder(ctx)
+                Ui.showDialog(new AlertDialog.Builder(ctx)
                         .setTitle("保存子目录名")
                         .setView(et)
                         .setPositiveButton("确定", new android.content.DialogInterface.OnClickListener() {
                             @Override public void onClick(android.content.DialogInterface d, int w) {
                                 Config.setStr("pubdownloadSubdir", et.getText().toString());
+                                if (subSubtitle != null) subSubtitle.setText(subdirDisplay());
                                 Toast.makeText(ctx, "已设为 " + subdirDisplay(), Toast.LENGTH_SHORT).show();
                             }
                         })
-                        .setNegativeButton("取消", null)
-                        .show();
+                        .setNegativeButton("取消", null));
             }
         });
+        sub.setClickable(true);
+        subdirRowHolder[0] = sub;
+        Ui.setRowEnabled(sub, Config.pubdownload);
         c3.addView(sub);
         box.addView(c3);
 
@@ -669,11 +781,10 @@ final class SettingsPanel {
 
         ScrollView sv = new ScrollView(ctx);
         sv.addView(box);
-        new AlertDialog.Builder(ctx)
+        Ui.showDialog(new AlertDialog.Builder(ctx)
                 .setTitle("解除限制")
                 .setView(sv)
-                .setPositiveButton("返回", null)
-                .show();
+                .setPositiveButton("返回", null));
     }
 
     private static String subdirDisplay() {
@@ -688,7 +799,7 @@ final class SettingsPanel {
     private static View recallBorderColorRow(final Context ctx) {
         final LinearLayout row = (LinearLayout) Ui.navRow(ctx, "撤回边框颜色", "当前：" + recallColorName(),
                 Ui.ACCENT, null);
-        final TextView subtitle = (TextView) ((LinearLayout) row.getChildAt(0)).getChildAt(1);
+        final TextView subtitle = rowSubtitle(row);
         final View swatch = new View(ctx);
         LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(Ui.dp(ctx, 18), Ui.dp(ctx, 18));
         size.rightMargin = Ui.dp(ctx, 12);
@@ -702,20 +813,24 @@ final class SettingsPanel {
         return row;
     }
 
-    private static void showRecallDisplayMode(final Context ctx, final android.widget.LinearLayout row) {
+    private static void showRecallDisplayMode(final Context ctx, final LinearLayout row,
+                                              final Runnable onChanged) {
         final String[] labels = {"仅撤回提示", "消息颜色标识"};
         int checked = Config.recallDisplayMode == Config.RECALL_MODE_HINT ? 0 : 1;
-        new AlertDialog.Builder(ctx).setTitle("撤回显示模式")
+        Ui.showDialog(new AlertDialog.Builder(ctx).setTitle("撤回显示模式")
                 .setSingleChoiceItems(labels, checked, new android.content.DialogInterface.OnClickListener() {
                     @Override public void onClick(android.content.DialogInterface dialog, int which) {
                         Config.setRecallDisplayMode(which == 0 ? Config.RECALL_MODE_HINT : Config.RECALL_MODE_COLOR);
-                        TextView subtitle = (TextView) ((LinearLayout) row.getChildAt(0)).getChildAt(1);
-                        subtitle.setText(Config.recallDisplayMode == Config.RECALL_MODE_HINT
-                                ? "保留原文，仅显示撤回提示" : "保留原文并用气泡颜色标识");
-                        RecallBubbleUi.schedule();
+                        TextView subtitle = rowSubtitle(row);
+                        if (subtitle != null) {
+                            subtitle.setText(Config.recallDisplayMode == Config.RECALL_MODE_HINT
+                                    ? "保留原文，仅显示撤回提示" : "保留原文并用气泡颜色标识");
+                        }
+                        if (onChanged != null) onChanged.run();
+                        try { RecallBubbleUi.schedule(); } catch (Throwable ignored) { }
                         dialog.dismiss();
                     }
-                }).setNegativeButton("取消", null).show();
+                }).setNegativeButton("取消", null));
     }
 
     private static String recallColorName() {
@@ -757,25 +872,30 @@ final class SettingsPanel {
             option.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
                     Config.setStr("recallBorderColor", color);
-                    subtitle.setText("当前：" + recallColorName());
+                    if (subtitle != null) subtitle.setText("当前：" + recallColorName());
                     updateRecallColorSwatch(selected);
                     dialog.dismiss();
                 }
             });
             options.addView(option);
         }
-        dialog.show();
-        Ui.styleDialog(dialog);
+        Ui.showDialog(dialog);
     }
 
     static void showRecallHintTextEditor(final Context ctx) {
+        showRecallHintTextEditor(ctx, null);
+    }
+
+    static void showRecallHintTextEditor(final Context ctx, final TextView subtitleView) {
         final EditText et = new EditText(ctx);
         et.setHint("例如：撤回了一条消息；或 {name} 撤回了消息");
         et.setText(Config.recallHintText);
+        et.setTextColor(Ui.titleColor(ctx));
+        et.setHintTextColor(Ui.muteColor(ctx));
         int p = Ui.dp(ctx, 16);
         et.setPadding(p, p, p, p);
         TextView tip = new TextView(ctx);
-        tip.setText("可含 {name} 或 {sender} 代表发送人；留空恢复默认「撤回了一条消息」。");
+        tip.setText("{name} 仅在系统撤回通知替换时生效；原气泡提示模式会自动忽略占位符。");
         tip.setTextSize(12);
         tip.setTextColor(Ui.subColor(ctx));
         tip.setPadding(p, 0, p, p / 2);
@@ -783,23 +903,24 @@ final class SettingsPanel {
         wrap.setOrientation(LinearLayout.VERTICAL);
         wrap.addView(et);
         wrap.addView(tip);
-        new AlertDialog.Builder(ctx)
+        Ui.showDialog(new AlertDialog.Builder(ctx)
                 .setTitle("撤回提示文案")
                 .setView(wrap)
                 .setPositiveButton("保存", new android.content.DialogInterface.OnClickListener() {
                     @Override public void onClick(android.content.DialogInterface d, int w) {
                         Config.setStr("recallHintText", et.getText().toString());
+                        if (subtitleView != null) subtitleView.setText("当前：" + Config.recallHintText);
                         Toast.makeText(ctx, "提示文案: " + Config.recallHintText, Toast.LENGTH_SHORT).show();
                     }
                 })
                 .setNeutralButton("恢复默认", new android.content.DialogInterface.OnClickListener() {
                     @Override public void onClick(android.content.DialogInterface d, int w) {
                         Config.setStr("recallHintText", "撤回了一条消息");
+                        if (subtitleView != null) subtitleView.setText("当前：" + Config.recallHintText);
                         Toast.makeText(ctx, "已恢复默认提示文案", Toast.LENGTH_SHORT).show();
                     }
                 })
-                .setNegativeButton("取消", null)
-                .show();
+                .setNegativeButton("取消", null));
     }
 
     // 组织巡游广播（发给模块进程的 OrgWalkerService）
@@ -880,14 +1001,5 @@ final class SettingsPanel {
         line.setBackgroundColor(Ui.divider(ctx));
         wrap.addView(line, new LinearLayout.LayoutParams(-1, 1));
         return wrap;
-    }
-
-    /** 状态栏高度（无 ActionBar 时也留出安全区）。 */
-    private static int statusBarPadding(Context ctx) {
-        try {
-            int id = ctx.getResources().getIdentifier("status_bar_height", "dimen", "android");
-            if (id > 0) return ctx.getResources().getDimensionPixelSize(id);
-        } catch (Throwable ignored) { }
-        return Ui.dp(ctx, 24);
     }
 }

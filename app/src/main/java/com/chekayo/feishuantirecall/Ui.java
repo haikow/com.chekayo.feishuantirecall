@@ -1,8 +1,10 @@
 package com.chekayo.feishuantirecall;
 
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.view.Gravity;
@@ -83,7 +85,19 @@ final class Ui {
         return d;
     }
 
-    static void styleDialog(final android.app.AlertDialog dialog) {
+    static AlertDialog showDialog(AlertDialog.Builder builder) {
+        AlertDialog dialog = builder.show();
+        styleDialog(dialog);
+        return dialog;
+    }
+
+    static AlertDialog showDialog(AlertDialog dialog) {
+        dialog.show();
+        styleDialog(dialog);
+        return dialog;
+    }
+
+    static void styleDialog(final AlertDialog dialog) {
         final android.view.Window window = dialog.getWindow();
         if (window == null) return;
         final Context c = dialog.getContext();
@@ -163,7 +177,8 @@ final class Ui {
         LinearLayout row = new LinearLayout(c);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setBackground(new android.graphics.drawable.RippleDrawable(
-                ColorStateList.valueOf(isNight(c) ? 0x223B9EFF : 0x163B9EFF), null, null));
+                ColorStateList.valueOf(isNight(c) ? 0x223B9EFF : 0x163B9EFF),
+                null, new ColorDrawable(Color.WHITE)));
         row.setMinimumHeight(dp(c, 64));
         row.setGravity(Gravity.CENTER_VERTICAL);
         int px = dp(c, 16), py = dp(c, 12);
@@ -198,7 +213,36 @@ final class Ui {
             }
         });
         row.addView(sw);
+        row.setClickable(true);
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (sw.isEnabled()) sw.toggle();
+            }
+        });
         return row;
+    }
+
+    /** 启用/禁用整行（含子开关与文字），用于父子配置项联动。 */
+    static void setRowEnabled(View row, boolean enabled) {
+        if (row == null) return;
+        row.setAlpha(enabled ? 1f : 0.45f);
+        row.setEnabled(enabled);
+        row.setClickable(enabled);
+        setChildrenEnabled(row, enabled);
+    }
+
+    private static void setChildrenEnabled(View v, boolean enabled) {
+        if (!(v instanceof ViewGroup)) return;
+        ViewGroup vg = (ViewGroup) v;
+        int count = vg.getChildCount();
+        for (int i = 0; i < count; i++) {
+            View child = vg.getChildAt(i);
+            child.setEnabled(enabled);
+            if (child instanceof CompoundButton) {
+                child.setClickable(enabled);
+            }
+            setChildrenEnabled(child, enabled);
+        }
     }
 
     /** 导航行：左标题+副标题，右 ›。整行可点。 */
@@ -206,7 +250,8 @@ final class Ui {
         LinearLayout row = new LinearLayout(c);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setBackground(new android.graphics.drawable.RippleDrawable(
-                ColorStateList.valueOf(isNight(c) ? 0x223B9EFF : 0x163B9EFF), null, null));
+                ColorStateList.valueOf(isNight(c) ? 0x223B9EFF : 0x163B9EFF),
+                null, new ColorDrawable(Color.WHITE)));
         row.setMinimumHeight(dp(c, 64));
         row.setGravity(Gravity.CENTER_VERTICAL);
         int px = dp(c, 16), py = dp(c, 12);
