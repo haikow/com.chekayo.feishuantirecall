@@ -58,7 +58,7 @@ public class UpdateBanner {
                     if (da != null && da.length() > 0) dl = da.optString(0, "");
                     if (dl.isEmpty()) dl = o.optString("download", "");
                     final String durl = dl;
-                    if (vc <= AntiRecall.MODULE_VERSION_CODE) return;   // 不是新版
+                    if (vc <= ModuleBuild.VERSION_CODE) return;   // 不是新版
                     if (vc == Config.dismissedUpc) return;              // 已忽略该版本
                     act.runOnUiThread(new Runnable() {
                         @Override public void run() { showBanner(act, vc, vn, durl); }
@@ -89,6 +89,7 @@ public class UpdateBanner {
 
     static void showBanner(Activity act, final int vc, String vn, final String durl) {
         try {
+            if (act == null || act.isFinishing() || act.isDestroyed()) return;
             ViewGroup content = (ViewGroup) act.findViewById(android.R.id.content);
             if (content == null || content.findViewById(BANNER_ID) != null) return;   // 无内容/已存在
 
@@ -96,12 +97,16 @@ public class UpdateBanner {
             bar.setId(BANNER_ID);
             bar.setOrientation(LinearLayout.HORIZONTAL);
             bar.setGravity(Gravity.CENTER_VERTICAL);
-            bar.setBackgroundColor(0xFF2B7FFF);
-            bar.setPadding(dp(act, 14), statusBarH(act) + dp(act, 8), dp(act, 10), dp(act, 8));
+            android.graphics.drawable.GradientDrawable bg = new android.graphics.drawable.GradientDrawable();
+            bg.setColor(0xFF2B7FFF);
+            bg.setCornerRadius(Ui.dp(act, 12));
+            bar.setBackground(bg);
+            bar.setElevation(Ui.dp(act, 6));
+            bar.setPadding(Ui.dp(act, 14), Ui.dp(act, 10), Ui.dp(act, 10), Ui.dp(act, 10));
             bar.setClickable(true);
 
             TextView tv = new TextView(act);
-            tv.setText("🔄 FeishuKit 有新版 v" + vn + "（当前 v" + AntiRecall.MODULE_VERSION + "）· 点击更新");
+            tv.setText("🔄 FeishuKit 有新版 v" + vn + "（当前 v" + ModuleBuild.VERSION + "）· 点击更新");
             tv.setTextColor(Color.WHITE);
             tv.setTextSize(14f);
             bar.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -110,7 +115,7 @@ public class UpdateBanner {
             close.setText("✕");
             close.setTextColor(0xFFEAF2FF);
             close.setTextSize(16f);
-            close.setPadding(dp(act, 14), 0, dp(act, 6), 0);
+            close.setPadding(Ui.dp(act, 14), 0, Ui.dp(act, 6), 0);
             bar.addView(close, new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -128,16 +133,13 @@ public class UpdateBanner {
                 }
             });
 
-            content.addView(bar, new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM);
+            int marginH = Ui.dp(act, 12);
+            lp.setMargins(marginH, 0, marginH, Ui.dp(act, 68));
+            content.addView(bar, lp);
         } catch (Throwable t) {
             XposedBridge.log("[fucklark] show update banner failed: " + t);
         }
-    }
-
-    static int dp(Activity a, float v) { return (int) (v * a.getResources().getDisplayMetrics().density + 0.5f); }
-    static int statusBarH(Activity a) {
-        int id = a.getResources().getIdentifier("status_bar_height", "dimen", "android");
-        return id > 0 ? a.getResources().getDimensionPixelSize(id) : dp(a, 24);
     }
 }

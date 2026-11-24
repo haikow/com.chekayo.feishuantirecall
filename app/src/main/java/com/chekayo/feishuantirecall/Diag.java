@@ -34,9 +34,12 @@ public class Diag {
             long len = FILE.exists() ? FILE.length() : 0;
             if (len > CAP) truncate();
             FileOutputStream os = new FileOutputStream(FILE, true);
-            os.write((TS.format(new Date()) + " " + msg + "\n").getBytes("UTF-8"));
-            os.flush();
-            os.close();
+            try {
+                os.write((TS.format(new Date()) + " " + msg + "\n").getBytes("UTF-8"));
+                os.flush();
+            } finally {
+                os.close();
+            }
             FILE.setReadable(true, false);
         } catch (Throwable ignored) {}
     }
@@ -50,18 +53,26 @@ public class Diag {
         w(message);
     }
 
-    /** 超过上限时保留后半段(最近的日志更有价值)。 */
+    /** 超过上限时按换行边界保留后半段，避免在 UTF-8 多字节字符中间截断导致乱码。 */
     static void truncate() {
         try {
+            if (FILE == null || !FILE.isFile()) return;
             byte[] all = readBytes(FILE);
-            int keep = all.length / 2;
-            byte[] tail = new byte[keep];
-            System.arraycopy(all, all.length - keep, tail, 0, keep);
+            int start = all.length / 2;
+            if (start > 0 && all[start - 1] != '\n') {
+                while (start < all.length && all[start] != '\n') start++;
+                if (start < all.length) start++;
+            }
+            int keep = all.length - start;
             FileOutputStream os = new FileOutputStream(FILE, false);
-            os.write("...(旧日志已截断)...\n".getBytes("UTF-8"));
-            os.write(tail);
-            os.flush();
-            os.close();
+            try {
+                os.write("...(旧日志已截断)...\n".getBytes("UTF-8"));
+                if (keep > 0) os.write(all, start, keep);
+                os.flush();
+            } finally {
+                os.close();
+            }
+            FILE.setReadable(true, false);
         } catch (Throwable ignored) {}
     }
 
@@ -80,10 +91,18 @@ public class Diag {
 
     static byte[] readBytes(File f) throws Exception {
         FileInputStream is = new FileInputStream(f);
-        byte[] b = new byte[(int) f.length()];
-        int off = 0, r;
-        while (off < b.length && (r = is.read(b, off, b.length - off)) > 0) off += r;
-        is.close();
-        return b;
+        try {
+            byte[] b = new byte[(int) f.length()];
+            int off = 0, r;
+            while (off < b.length && (r = is.read(b, off, b.length - off)) > 0) off += r;
+            if (off < b.length) {
+                byte[] exact = new byte[off];
+                System.arraycopy(b, 0, exact, 0, off);
+                return exact;
+            }
+            return b;
+        } finally {
+            is.close();
+        }
     }
 }

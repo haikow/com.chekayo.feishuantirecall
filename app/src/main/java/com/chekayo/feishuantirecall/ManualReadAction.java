@@ -26,6 +26,28 @@ final class ManualReadAction {
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final java.util.Set<String> IN_FLIGHT = java.util.Collections.newSetFromMap(
             new ConcurrentHashMap<String, Boolean>());
+    private static final ConcurrentHashMap<Class<?>, BuilderSpec> BUILDER_SPECS =
+            new ConcurrentHashMap<Class<?>, BuilderSpec>();
+    private static final ConcurrentHashMap<Class<?>, Field> ACTION_LIST_FIELDS =
+            new ConcurrentHashMap<Class<?>, Field>();
+    private static final ConcurrentHashMap<Class<?>, Method> ACTION_LIST_GETTERS =
+            new ConcurrentHashMap<Class<?>, Method>();
+
+    private static final class BuilderSpec {
+        final Constructor<?> constructor;
+        final Method callbackSetter;
+        final Class<?> callbackClass;
+        final Method intSetter;
+        final Method buildMethod;
+        BuilderSpec(Constructor<?> constructor, Method callbackSetter, Class<?> callbackClass,
+                    Method intSetter, Method buildMethod) {
+            this.constructor = constructor;
+            this.callbackSetter = callbackSetter;
+            this.callbackClass = callbackClass;
+            this.intSetter = intSetter;
+            this.buildMethod = buildMethod;
+        }
+    }
 
     static void install(final ClassLoader cl) {
         try {
@@ -40,7 +62,7 @@ final class ManualReadAction {
             XposedBridge.hookMethod(parse, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     try {
-                        if (!Config.antiread || AntiRecall.TAMPER == 2 || p.getResult() == null) return;
+                        if (!Config.antiread || p.getResult() == null) return;
                         final Object ctx = p.args[entry.contextIndex];
                         final Object message = messageGetter.invoke(ctx);
                         final String account = RecallMessages.account();
@@ -48,7 +70,13 @@ final class ManualReadAction {
                         final String chat = text(message, "getChatId"), id = text(message, "getId");
 
                         Object result = p.getResult();
-                        List<?> original = (List<?>) result.getClass().getMethod("getActionList").invoke(result);
+                        Class<?> resultClass = result.getClass();
+                        Method actionListGetter = ACTION_LIST_GETTERS.get(resultClass);
+                        if (actionListGetter == null) {
+                            actionListGetter = resultClass.getMethod("getActionList");
+                            ACTION_LIST_GETTERS.put(resultClass, actionListGetter);
+                        }
+                        List<?> original = (List<?>) actionListGetter.invoke(result);
                         if (original == null || original.isEmpty()) return; // 不绕过宿主禁止菜单的情形
 
                         // 动态查找网格项的结束位置
@@ -118,11 +146,17 @@ final class ManualReadAction {
     }
 
     private static Field findActionListField(Object result, List<?> actionList) throws Exception {
-        for (Class<?> type = result.getClass(); type != null; type = type.getSuperclass()) {
+        Class<?> resultClass = result.getClass();
+        Field cached = ACTION_LIST_FIELDS.get(resultClass);
+        if (cached != null && cached.get(result) == actionList) return cached;
+        for (Class<?> type = resultClass; type != null; type = type.getSuperclass()) {
             for (Field field : type.getDeclaredFields()) {
                 if (!List.class.isAssignableFrom(field.getType())) continue;
                 field.setAccessible(true);
-                if (field.get(result) == actionList) return field;
+                if (field.get(result) == actionList) {
+                    ACTION_LIST_FIELDS.put(resultClass, field);
+                    return field;
+                }
             }
         }
         throw new NoSuchFieldException("menu action list field by identity");
@@ -160,7 +194,9 @@ final class ManualReadAction {
         catch (Throwable ignored) { return false; }
     }
 
-    private static Object createItem(ClassLoader cl, Class<?> itemClass, Context context, final Runnable click) throws Exception {
+    private static BuilderSpec resolveBuilderSpec(Class<?> itemClass) throws Exception {
+        BuilderSpec cached = BUILDER_SPECS.get(itemClass);
+        if (cached != null) return cached;
         Class<?> builderClass = findBuilderClass(itemClass);
         Method callbackSetter = null;
         Class<?> callback = null;
@@ -175,9 +211,23 @@ final class ManualReadAction {
         }
         if (callbackSetter == null) throw new NoSuchMethodException("menu callback setter by signature");
         callbackSetter.setAccessible(true);
+        Constructor<?> constructor = builderClass.getDeclaredConstructor(android.graphics.drawable.Drawable.class, String.class);
+        constructor.setAccessible(true);
+        Method intSetter = findIntSetter(builderClass);
+        Method build = findBuildMethod(builderClass, itemClass);
         Diag.once("[fucklark] manual-read callback matched: " + callback.getName()
                 + " setter=" + callbackSetter.toGenericString());
-        Object proxy = Proxy.newProxyInstance(cl, new Class<?>[]{callback}, new InvocationHandler() {
+        Diag.once("[fucklark] manual-read builder matched: " + builderClass.getName()
+                + " ctor=" + constructor.toGenericString());
+        Diag.once("[fucklark] manual-read builder output matched: " + build.toGenericString());
+        BuilderSpec spec = new BuilderSpec(constructor, callbackSetter, callback, intSetter, build);
+        BUILDER_SPECS.put(itemClass, spec);
+        return spec;
+    }
+
+    private static Object createItem(ClassLoader cl, Class<?> itemClass, Context context, final Runnable click) throws Exception {
+        BuilderSpec spec = resolveBuilderSpec(itemClass);
+        Object proxy = Proxy.newProxyInstance(cl, new Class<?>[]{spec.callbackClass}, new InvocationHandler() {
             @Override public Object invoke(Object p, Method m, Object[] args) {
                 if (m.getDeclaringClass() == Object.class) return objectMethod(p, m, args);
                 if (args != null && args.length == 2 && args[0] instanceof View && args[1] instanceof Boolean) click.run();
@@ -185,17 +235,12 @@ final class ManualReadAction {
             }
         });
 
-        android.graphics.drawable.Drawable icon = context.getDrawable(android.R.drawable.ic_menu_view);
-        Constructor<?> constructor = builderClass.getDeclaredConstructor(android.graphics.drawable.Drawable.class, String.class);
-        constructor.setAccessible(true);
-        Diag.once("[fucklark] manual-read builder matched: " + builderClass.getName()
-                + " ctor=" + constructor.toGenericString());
-        Object b = constructor.newInstance(icon, "标为已读");
-        callbackSetter.invoke(b, proxy);
-        findIntSetter(builderClass).invoke(b, 5);
-        Method build = findBuildMethod(builderClass, itemClass);
-        Diag.once("[fucklark] manual-read builder output matched: " + build.toGenericString());
-        return build.invoke(b);
+        android.graphics.drawable.Drawable icon = new ReadReceiptDrawable(
+                Ui.titleColor(context), context.getResources().getDisplayMetrics().density);
+        Object b = spec.constructor.newInstance(icon, "标为已读");
+        spec.callbackSetter.invoke(b, proxy);
+        spec.intSetter.invoke(b, 5);
+        return spec.buildMethod.invoke(b);
     }
 
     private static Class<?> findBuilderClass(Class<?> itemClass) throws NoSuchMethodException {
@@ -270,7 +315,7 @@ final class ManualReadAction {
             @Override public void run() {
                 Boolean previous = AntiRecall.KN_REPLAY.get();
                 try {
-                    if (!Config.antiread || AntiRecall.TAMPER == 2 || !account.equals(RecallMessages.account())
+                    if (!Config.antiread || !account.equals(RecallMessages.account())
                             || !eligible(message, account)) throw new IllegalStateException("账号或消息状态已变化");
                     Object channel = channelOf(template.m);
                     if (!chat.equals(AntiRecall.channelId(channel))) throw new IllegalStateException("会话模板不匹配");

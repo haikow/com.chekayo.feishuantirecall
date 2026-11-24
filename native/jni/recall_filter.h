@@ -3,8 +3,10 @@
 // 防撤回 SQL 策略同时适配 SQLCipher/WCDB：在宿主原连接上调用原始 SQLite 入口；
 // JNI 只查询已提交的内存快照，绝不把数据库连接交给 UI 线程。
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <set>
@@ -50,14 +52,22 @@ inline long long number(const std::string &s) {
     }
     return n;
 }
-struct Owners { std::mutex mutex; std::map<std::string, std::string> ids; };
+struct Owners {
+    std::mutex mutex;
+    std::map<std::string, std::string> ids;
+    std::atomic<uint64_t> generation{0};
+};
 inline Owners &owners() { static Owners value; return value; }
 inline void bindOwner(const std::string &storage, const std::string &uid) {
     if (!number(uid) || storage.empty()) return;
     for (char c : storage) if (!std::isxdigit((unsigned char)c)) return;
     auto &o = owners();
     std::lock_guard<std::mutex> guard(o.mutex);
-    o.ids[storage] = uid;
+    auto it = o.ids.find(storage);
+    if (it == o.ids.end() || it->second != uid) {
+        o.ids[storage] = uid;
+        o.generation.fetch_add(1, std::memory_order_release);
+    }
 }
 // SDK 库目录可能是账号哈希；只有已验证绑定的目录才映射为账号，未知目录不猜测。
 inline std::string owner(const std::string &path) {
@@ -221,7 +231,16 @@ class Store {
     std::mutex mutex;
     std::map<std::string, Snapshot> snapshots;
     std::map<std::pair<const void*, void*>, std::string> pending;
+    std::set<std::pair<const void*, void*>> observed_clean;
+    std::atomic<bool> has_pending{false};
+    std::atomic<uint64_t> epoch_counter{0};
+    uint64_t observed_owners_gen = 0;
 public:
+    uint64_t epoch() const { return epoch_counter.load(std::memory_order_relaxed); }
+    void clearObserved() {
+        std::lock_guard<std::mutex> guard(mutex);
+        observed_clean.clear();
+    }
     bool contains(const std::string &uid, long long chat, long long id) {
         if (uid.empty() || chat <= 0 || id <= 0) return false;
         std::lock_guard<std::mutex> guard(mutex);
@@ -262,34 +281,77 @@ public:
         Snapshot &current = snapshots[path];
         if (current.uid != value.uid) current = Snapshot{};
         current.uid = value.uid;
+        size_t before = current.marks.size();
         current.marks.insert(value.marks.begin(), value.marks.end());
+        if (current.marks.size() > before) {
+            epoch_counter.fetch_add(1, std::memory_order_relaxed);
+        }
         if (a.trace) a.trace(snapshots[path].marks.empty() ? "本账号撤回标记快照为空" : "已载入本账号撤回标记快照");
         return true;
     }
     void observe(const Api &a, const void *provider, void *db, bool messages) {
+        if (!messages && !has_pending.load(std::memory_order_acquire)) return;
+        auto key = std::make_pair(provider, db);
+        {
+            uint64_t og = owners().generation.load(std::memory_order_acquire);
+            std::lock_guard<std::mutex> guard(mutex);
+            if (og != observed_owners_gen) {
+                observed_clean.clear();
+                observed_owners_gen = og;
+            }
+            if (pending.find(key) == pending.end()
+                    && (!messages || observed_clean.find(key) != observed_clean.end())) {
+                return;
+            }
+        }
         ConnectionLock connection(a, db);
         const char *fn = a.filename ? a.filename(db, "main") : nullptr;
         if (!fn || !a.autocommit) return;
         std::string path(fn);
-        if (owner(path).empty()) return;
+        if (owner(path).empty()) {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto it = pending.find(key);
+            if (it != pending.end() && it->second != path) {
+                pending.erase(it);
+                observed_clean.erase(key);
+                has_pending.store(!pending.empty(), std::memory_order_release);
+            }
+            return;
+        }
         bool refresh = false;
-        auto key = std::make_pair(provider, db);
         {
             std::lock_guard<std::mutex> guard(mutex);
             auto it = pending.find(key);
-            if (it != pending.end() && it->second != path) { pending.erase(it); it = pending.end(); }
-            refresh = it != pending.end() || (messages && snapshots.find(path) == snapshots.end());
-            if (refresh) pending[key] = path;
+            if (it != pending.end() && it->second != path) {
+                pending.erase(it);
+                observed_clean.erase(key);
+                has_pending.store(!pending.empty(), std::memory_order_release);
+                it = pending.end();
+            }
+            bool loaded = snapshots.find(path) != snapshots.end();
+            refresh = it != pending.end() || (messages && !loaded);
+            if (refresh) {
+                pending[key] = path;
+                observed_clean.erase(key);
+                has_pending.store(true, std::memory_order_release);
+            } else if (messages && loaded) {
+                observed_clean.insert(key);
+            }
         }
         if (refresh && load(a, db, path)) {
             std::lock_guard<std::mutex> guard(mutex);
             pending.erase(key);
+            has_pending.store(!pending.empty(), std::memory_order_release);
+            observed_clean.insert(key);
         }
     }
     void changed(const Api &a, const void *provider, void *db, const std::string &path) {
         if (!load(a, db, path)) {
             std::lock_guard<std::mutex> guard(mutex);
-            pending[std::make_pair(provider, db)] = path;
+            auto key = std::make_pair(provider, db);
+            pending[key] = path;
+            observed_clean.erase(key);
+            has_pending.store(true, std::memory_order_release);
         }
     }
     // 自己的消息交给宿主正常撤回；他人的原文保留并在同一事务里落撤回标记。
@@ -366,7 +428,11 @@ public:
             exec(a, db, "RELEASE feishukit_recall_guard");
             return result;
         }
+        uint64_t before_epoch = epoch_counter.load(std::memory_order_relaxed);
         changed(a, provider, db, path);
+        if (a.autocommit(db) && epoch_counter.load(std::memory_order_relaxed) == before_epoch) {
+            epoch_counter.fetch_add(1, std::memory_order_relaxed);
+        }
         if (a.trace) a.trace("撤回写入已安全处理：原文保留，撤回标记已记录");
         return result;
     }

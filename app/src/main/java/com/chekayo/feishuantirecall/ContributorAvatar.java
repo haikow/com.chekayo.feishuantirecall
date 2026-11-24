@@ -3,7 +3,6 @@ package com.chekayo.feishuantirecall;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
-import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
@@ -11,9 +10,13 @@ import android.widget.TextView;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.util.Set;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -22,9 +25,10 @@ import java.util.concurrent.Executors;
 final class ContributorAvatar {
     private static final ExecutorService LOADERS = Executors.newFixedThreadPool(2);
     private static final android.os.Handler MAIN = new android.os.Handler(android.os.Looper.getMainLooper());
-    private static final java.util.Map<String, Bitmap> CACHE = new ConcurrentHashMap<String, Bitmap>();
-    private static final Set<String> LOADING = java.util.Collections.newSetFromMap(
-            new ConcurrentHashMap<String, Boolean>());
+    private static final Map<String, Bitmap> CACHE = new ConcurrentHashMap<String, Bitmap>();
+    private static final Object PENDING_LOCK = new Object();
+    private static final Map<String, List<WeakReference<ImageView>>> PENDING =
+            new HashMap<String, List<WeakReference<ImageView>>>();
 
     static FrameLayout create(final Context context, final String username, String initial, int sizeDp) {
         final FrameLayout frame = new FrameLayout(context);
@@ -54,16 +58,44 @@ final class ContributorAvatar {
     }
 
     private static void load(final String username, final ImageView target) {
-        if (!LOADING.add(username)) return;
+        boolean shouldStart = false;
+        synchronized (PENDING_LOCK) {
+            Bitmap cached = CACHE.get(username);
+            if (cached != null) {
+                target.setImageBitmap(cached);
+                return;
+            }
+            List<WeakReference<ImageView>> waiters = PENDING.get(username);
+            if (waiters == null) {
+                waiters = new ArrayList<WeakReference<ImageView>>();
+                PENDING.put(username, waiters);
+                shouldStart = true;
+            }
+            waiters.add(new WeakReference<ImageView>(target));
+        }
+        if (!shouldStart) return;
         LOADERS.execute(new Runnable() {
             @Override public void run() {
-                Bitmap bitmap = download(username);
-                if (bitmap != null) CACHE.put(username, bitmap);
-                LOADING.remove(username);
+                Bitmap bitmap = null;
+                final List<WeakReference<ImageView>> waiters;
+                try {
+                    bitmap = download(username);
+                } finally {
+                    synchronized (PENDING_LOCK) {
+                        if (bitmap != null) CACHE.put(username, bitmap);
+                        waiters = PENDING.remove(username);
+                    }
+                }
+                if (bitmap == null || waiters == null || waiters.isEmpty()) return;
                 final Bitmap result = bitmap;
                 MAIN.post(new Runnable() {
                     @Override public void run() {
-                        if (result != null && target.isAttachedToWindow()) target.setImageBitmap(result);
+                        for (int i = 0; i < waiters.size(); i++) {
+                            ImageView iv = waiters.get(i).get();
+                            if (iv != null && iv.isAttachedToWindow()) {
+                                iv.setImageBitmap(result);
+                            }
+                        }
                     }
                 });
             }

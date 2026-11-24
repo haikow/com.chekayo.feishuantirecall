@@ -11,7 +11,6 @@ import java.util.Map;
 import java.util.WeakHashMap;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
 
 /** 消息下方时间：使用绑定模型的 create_time（秒），不解析相对日期文案。 */
 final class MessageTimeDisplay {
@@ -25,6 +24,14 @@ final class MessageTimeDisplay {
     private static boolean reportedTimeView, reportedBindingError;
     private static final Map<Class<?>, Method[]> TIMESTAMPS =
             new java.util.concurrent.ConcurrentHashMap<Class<?>, Method[]>();
+    private static final Map<Class<?>, Field> HOLDER_ROOT_FIELDS =
+            new java.util.concurrent.ConcurrentHashMap<Class<?>, Field>();
+    private static final Object NO_ROOT_SENTINEL = new Object();
+    private static final Field NO_ROOT_FIELD = resolveNoRootField();
+    private static Field resolveNoRootField() {
+        try { return MessageTimeDisplay.class.getDeclaredField("NO_ROOT_SENTINEL"); }
+        catch (Throwable t) { throw new AssertionError(t); }
+    }
     private static java.io.File anchorFile;
     private static String anchorIdentity;
     private static volatile boolean anchorConfirmed;
@@ -98,14 +105,14 @@ final class MessageTimeDisplay {
                     @Override protected void afterHookedMethod(MethodHookParam p) { afterBind(binding, p.args[0], p.args[1]); }
                 });
             }
-            XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) {
+            ViewHookHub.addSetVisibilityListener(new ViewHookHub.SetVisibilityListener() {
+                @Override public int beforeSetVisibility(View view, int visibility) {
                     if (!Config.messageTimeAlways || changing || Looper.myLooper() != Looper.getMainLooper()
-                            || !(p.thisObject instanceof TextView)) return;
-                    State state = VIEWS.get((TextView) p.thisObject);
-                    if (state == null) return;
-                    state.visibility = (Integer) p.args[0];
-                    if (state.seconds > 0) p.args[0] = View.VISIBLE;
+                            || !(view instanceof TextView)) return visibility;
+                    State state = VIEWS.get((TextView) view);
+                    if (state == null) return visibility;
+                    state.visibility = visibility;
+                    return state.seconds > 0 ? View.VISIBLE : visibility;
                 }
             });
             installed = true;
@@ -286,18 +293,31 @@ final class MessageTimeDisplay {
 
     private static View holderRoot(Object holder) {
         if (holder == null) return null;
+        Class<?> holderClass = holder.getClass();
+        Field cached = HOLDER_ROOT_FIELDS.get(holderClass);
+        if (cached == NO_ROOT_FIELD) return null;
+        if (cached != null) {
+            try { return (View) cached.get(holder); }
+            catch (Throwable ignored) { return null; }
+        }
         java.util.ArrayList<Class<?>> hierarchy = new java.util.ArrayList<Class<?>>();
-        for (Class<?> type = holder.getClass(); type != null; type = type.getSuperclass()) hierarchy.add(0, type);
+        for (Class<?> type = holderClass; type != null; type = type.getSuperclass()) hierarchy.add(0, type);
+        boolean hasViewField = false;
         for (Class<?> type : hierarchy) {
             for (Field field : type.getDeclaredFields()) {
                 if (!View.class.isAssignableFrom(field.getType())) continue;
+                hasViewField = true;
                 try {
                     field.setAccessible(true);
                     View view = (View) field.get(holder);
-                    if (view != null) return view;
+                    if (view != null) {
+                        HOLDER_ROOT_FIELDS.put(holderClass, field);
+                        return view;
+                    }
                 } catch (Throwable ignored) { }
             }
         }
+        if (!hasViewField) HOLDER_ROOT_FIELDS.put(holderClass, NO_ROOT_FIELD);
         return null;
     }
 

@@ -65,7 +65,7 @@ print('\n'.join(bad))" 2>/dev/null)
 NATIVE=$(echo "$FILES_JSON" | python -c "
 import sys,json
 bad=[f['filename'] for f in json.load(sys.stdin)
-     if f['filename'].startswith('jni/') or f['filename'].split('?')[0].endswith(('.c','.cpp','.cc','.h','.so'))]
+     if f['filename'].startswith(('jni/', 'native/jni/')) or f['filename'].split('?')[0].endswith(('.c','.cpp','.cc','.h','.so'))]
 print('\n'.join(bad))" 2>/dev/null)
 BUILDSL=$(echo "$FILES_JSON" | python -c "
 import sys,json

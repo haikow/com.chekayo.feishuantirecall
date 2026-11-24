@@ -3,6 +3,8 @@ package com.chekayo.feishuantirecall;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.View;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -21,8 +23,15 @@ import org.json.JSONObject;
 /** 最近 200 条屏蔽记录，由模块 Provider 汇总，桌面和飞书读取同一份记录。 */
 final class BlockLog {
     private static final int LIMIT = 200;
+    private static final int MAX_EVENT_JSON_BYTES = 32 * 1024;
+    private static final Handler MAIN = createMainHandler();
     private static final ExecutorService IO = Executors.newSingleThreadExecutor();
     private static final Map<View, String> LAST = new WeakHashMap<View, String>();
+
+    private static Handler createMainHandler() {
+        try { return new Handler(Looper.getMainLooper()); }
+        catch (Throwable ignored) { return null; }
+    }
 
     static void record(final String kind, View view, final String via) {
         final Context c = Config.appContextForSync();
@@ -33,10 +42,9 @@ final class BlockLog {
     /** 延迟读取自绘控件，避免在消息布局/隐藏的主线程调用链里执行 view.draw。 */
     static void recordDeferred(final String kind, View view, final String via) {
         final Context c = Config.appContextForSync();
-        if (c == null || view == null) return;
+        if (c == null || view == null || MAIN == null) return;
         final WeakReference<View> ref = new WeakReference<View>(view);
-        final android.os.Handler main = new android.os.Handler(android.os.Looper.getMainLooper());
-        main.postDelayed(new Runnable() {
+        MAIN.postDelayed(new Runnable() {
             @Override public void run() {
                 View target = ref.get();
                 if (target == null) return;
@@ -86,9 +94,25 @@ final class BlockLog {
         });
     }
 
+    static boolean isValidEventJson(String json) {
+        if (json == null || json.isEmpty() || json.length() > MAX_EVENT_JSON_BYTES) return false;
+        try {
+            if (json.getBytes("UTF-8").length > MAX_EVENT_JSON_BYTES) return false;
+            JSONObject event = new JSONObject(json);
+            if (event.optLong("time", 0) <= 0) return false;
+            if (event.optString("kind", "").trim().isEmpty()) return false;
+            if (event.optString("via", "").trim().isEmpty()) return false;
+            if (event.optString("package", "").trim().isEmpty()) return false;
+            if (event.optString("process", "").trim().isEmpty()) return false;
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static File file(Context c) { return new File(c.getFilesDir(), "block_log.json"); }
     static synchronized void appendLocal(Context c, String json) throws Exception {
-        if (json == null) return;
+        if (c == null || !isValidEventJson(json)) return;
         File f = file(c);
         JSONArray entries;
         try { entries = f.exists() ? new JSONArray(Config.read(f)) : new JSONArray(); }
@@ -177,18 +201,15 @@ final class BlockLog {
 
     public static class Receiver extends android.content.BroadcastReceiver {
         @Override public void onReceive(final Context c, final android.content.Intent i) {
+            if (c == null || i == null) return;
+            if (!"com.chekayo.feishuantirecall.BLOCK_LOG_ADD".equals(i.getAction())) return;
+            final String json = i.getStringExtra("json");
+            if (!isValidEventJson(json)) return;
             final PendingResult pending = goAsync();
             IO.execute(new Runnable() {
                 @Override public void run() {
                     try {
-                        if ("com.chekayo.feishuantirecall.BLOCK_LOG_ADD".equals(i.getAction()))
-                            appendLocal(c, i.getStringExtra("json"));
-                        else if ("com.chekayo.feishuantirecall.BLOCK_LOG_GET".equals(i.getAction())) {
-                            android.os.ResultReceiver reply = i.getParcelableExtra("reply");
-                            if (reply != null) {
-                                Bundle b = new Bundle(); b.putString("text", readLocal(c)); reply.send(0, b);
-                            }
-                        }
+                        appendLocal(c, json);
                     } catch (Throwable t) { android.util.Log.w("fucklark", "日志广播处理失败", t); }
                     finally { pending.finish(); }
                 }

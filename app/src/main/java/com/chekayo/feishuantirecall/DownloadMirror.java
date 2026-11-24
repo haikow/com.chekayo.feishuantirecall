@@ -38,7 +38,8 @@ public class DownloadMirror {
 
     static volatile boolean INSTALLED = false;
     static volatile FileObserver observer;                        // 强引用防 GC
-    static final HashMap<String, Long> recent = new HashMap<>();  // 去重: 文件名 -> 上次处理时间
+    static final HashMap<String, Long> recent = new HashMap<String, Long>();  // 去重: path|size|mtime -> 上次处理时间
+    private static final android.os.Handler MAIN = new android.os.Handler(android.os.Looper.getMainLooper());
 
     public static void install(Context ctx) {
         if (INSTALLED) return;
@@ -109,7 +110,7 @@ public class DownloadMirror {
     // 后台线程复制(勿在 UI 线程 / toast 格式化里同步拷大文件), 带短时去重。
     static void mirrorAsync(final Context ctx, final File src) {
         final String name = src.getName();
-        if (isDup(name)) return;
+        if (isDup(src)) return;
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
@@ -117,17 +118,26 @@ public class DownloadMirror {
                     XposedBridge.log("[fucklark][dl] 已另存到系统下载: " + name);
                 } catch (Throwable t) {
                     XposedBridge.log("[fucklark][dl] 另存失败(" + name + "): " + t);
+                    MAIN.post(new Runnable() {
+                        @Override public void run() {
+                            try {
+                                android.widget.Toast.makeText(ctx, "另存到系统下载失败: " + name,
+                                        android.widget.Toast.LENGTH_SHORT).show();
+                            } catch (Throwable ignored) {}
+                        }
+                    });
                 }
             }
         }, "fucklark-dl-mirror").start();
     }
 
-    static synchronized boolean isDup(String name) {
+    static synchronized boolean isDup(File src) {
+        String key = src.getAbsolutePath() + "|" + src.length() + "|" + src.lastModified();
         long now = System.currentTimeMillis();
-        Long last = recent.get(name);
-        recent.put(name, now);
+        Long last = recent.get(key);
+        recent.put(key, Long.valueOf(now));
         if (recent.size() > 256) recent.clear();
-        return last != null && now - last < 8000;   // 8s 内同名视为重复
+        return last != null && now - last.longValue() < 8000;   // 8s 内同文件(同路径+大小+修改时间)视为重复
     }
 
     // 复制到公共 Download/[子目录]。Android 10+ 走 MediaStore.Downloads(无需权限); 9 及以下直接写公共目录。
@@ -141,13 +151,18 @@ public class DownloadMirror {
             v.put(MediaStore.Downloads.IS_PENDING, 1);
             Uri item = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
             if (item == null) throw new Exception("MediaStore.insert 返回 null");
-            try (InputStream in = new FileInputStream(src); OutputStream out = resolver.openOutputStream(item)) {
-                if (out == null) throw new Exception("openOutputStream null");
-                pump(in, out);
+            try {
+                try (InputStream in = new FileInputStream(src); OutputStream out = resolver.openOutputStream(item)) {
+                    if (out == null) throw new Exception("openOutputStream null");
+                    pump(in, out);
+                }
+                v.clear();
+                v.put(MediaStore.Downloads.IS_PENDING, 0);
+                resolver.update(item, v, null, null);
+            } catch (Exception e) {
+                try { resolver.delete(item, null, null); } catch (Throwable ignored) {}
+                throw e;
             }
-            v.clear();
-            v.put(MediaStore.Downloads.IS_PENDING, 0);
-            resolver.update(item, v, null, null);
         } else {
             File base = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
             File dstDir = (subdir == null || subdir.isEmpty()) ? base : new File(base, subdir);

@@ -59,4 +59,19 @@ jobs:
         run: |
           # CI 无私钥: 让 build.sh 自动生成丢弃型 debug keystore, 仅验证可编译可打包
           ./build.sh
-          test -s feishu-antirecall.apk && echo "BUILD_VERIFY_OK size=$(stat -c%s feishu-antirecall.apk)"
+          test -s feishu-antirecall.apk && echo "BUILD_VERIFY_OK size=$(wc -c < feishu-antirecall.apk | tr -d ' ')"
+      - name: Run unit tests (PR gate + Java recall)
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+        run: |
+          python3 -m unittest discover -s tests/pr_gate -v
+          ANDROID_JAR="$(ls "$ANDROID_HOME"/platforms/*/android.jar | sort -V | tail -1)"
+          mkdir -p build/recall-tests
+          find tests/recall/stubs -name '*.java' > build/recall-stubs.list
+          javac -encoding UTF-8 -source 8 -target 8 -d build/recall-tests @build/recall-stubs.list
+          CP="build/recall-tests:build/app:build/stubs:$ANDROID_JAR"
+          javac -encoding UTF-8 -source 8 -target 8 -cp "$CP" -d build/recall-tests \
+            tests/recall/RecallBehaviorTest.java \
+            tests/recall/RecallAuditRegressionTest.java
+          java -cp "$CP" com.chekayo.feishuantirecall.RecallBehaviorTest
+          java -cp "$CP" com.chekayo.feishuantirecall.RecallAuditRegressionTest

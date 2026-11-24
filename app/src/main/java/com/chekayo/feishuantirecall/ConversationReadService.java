@@ -48,7 +48,7 @@ final class ConversationReadService {
         catch (Exception invalid) { completion.done(false, "会话或账号尚未就绪，请稍后重试"); return; }
         WeakReference<Object> ref = CLIENTS.get(account);
         final Object client = ref == null ? null : ref.get();
-        if (client == null || AntiRecall.TAMPER == 2) {
+        if (client == null) {
             completion.done(false, "已读服务尚未就绪，请重新启动飞书后重试"); return;
         }
         final String key = account + ":" + chat;
@@ -136,7 +136,7 @@ final class ConversationReadService {
             request = found;
         }
         void check() {
-            if (!account.equals(RecallMessages.account()) || AntiRecall.TAMPER == 2)
+            if (!account.equals(RecallMessages.account()))
                 throw new IllegalStateException("账号已变化");
         }
         Object call(String requestName, String responseName, String commandName, byte[] bytes, boolean manual) throws Exception {

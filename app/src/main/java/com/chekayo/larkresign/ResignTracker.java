@@ -5,9 +5,6 @@ import android.content.Context;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipFile;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -70,20 +67,9 @@ public class ResignTracker implements IXposedHookLoadPackage, IXposedHookZygoteI
             @Override protected void beforeHookedMethod(MethodHookParam p) {
                 android.app.Activity activity = (android.app.Activity) p.args[0];
                 String name = activity.getClass().getName().toLowerCase(java.util.Locale.ROOT);
-                if (name.contains("contact") || name.contains("department") || name.contains("organization"))
+                if (name.contains("contact") || name.contains("department")
+                        || name.contains("organization") || name.contains("structure"))
                     requestRefresh("进入通讯录 " + activity.getClass().getSimpleName());
-            }
-        });
-        XposedHelpers.findAndHookMethod(android.widget.TextView.class, "setText",
-                CharSequence.class, android.widget.TextView.BufferType.class, new XC_MethodHook() {
-            @Override protected void afterHookedMethod(MethodHookParam p) {
-                if (p.args[0] == null) return;
-                String title = p.args[0].toString().trim();
-                android.widget.TextView v = (android.widget.TextView) p.thisObject;
-                String id = "";
-                try { id = v.getResources().getResourceEntryName(v.getId()); } catch (Throwable ignored) {}
-                if ("breadcrumb_label_tv".equals(id) || title.equals("组织架构")
-                        || title.equals("组织内联系人") || title.equals("组织结构")) requestRefresh("组织架构加载");
             }
         });
     }
@@ -143,17 +129,18 @@ public class ResignTracker implements IXposedHookLoadPackage, IXposedHookZygoteI
             com.chekayo.feishuantirecall.AccountPaths.bind(ctx, PKG);
         } catch (Throwable t) { XposedBridge.log(TAG + ": AccountPaths.bind err " + t); }
 
-        // 抽 native .so 到私有目录并加载
-        File dataDir = ctx.getFilesDir().getParentFile();
-        try {
-            com.chekayo.feishuantirecall.AccountPaths.bind(ctx, PKG);
-        } catch (Throwable t) { XposedBridge.log(TAG + ": AccountPaths.bind err " + t); }
-        File so = new File(new File(dataDir, "resign_tracker_lib"), "libresign.so");
-        so.getParentFile().mkdirs();
-        extractSo(so);
-        System.load(so.getAbsolutePath());
-        XposedBridge.log(TAG + ": native loaded " + so.getAbsolutePath()
-                + " uid=" + com.chekayo.feishuantirecall.AccountPaths.currentUid);
+        // 复用 AntiRecall 统一加载的合并版 libantirecall.so（含离职统计 JNI）
+        boolean loaded = false;
+        for (int i = 0; i < 60; i++) {
+            if (AntiRecall.ensureNativeLoaded()) { loaded = true; break; }
+            sleep(250);
+        }
+        if (!loaded) {
+            XposedBridge.log(TAG + ": AntiRecall.ensureNativeLoaded failed, abort");
+            return;
+        }
+        XposedBridge.log(TAG + ": shared native loaded uid="
+                + com.chekayo.feishuantirecall.AccountPaths.currentUid);
 
         final Context appCtx = ctx;
         Thread t = new Thread(new Runnable() {
@@ -271,8 +258,8 @@ public class ResignTracker implements IXposedHookLoadPackage, IXposedHookZygoteI
                 long now = System.currentTimeMillis();
                 for (int i = 0; i < snap.length(); i++) {
                     JSONObject r = snap.getJSONObject(i);
-                    String id = r.optString("id", "");
-                    if (id.isEmpty()) continue;
+                    String id = r.optString("id", "").trim();
+                    if (!ProfileBulk.isValidNumericUid(id)) continue;
                     JSONObject e = all.optJSONObject(id);
                     if (e == null) { e = new JSONObject(); e.put("first_seen", now); }
                     e.put("id", id);
@@ -290,21 +277,6 @@ public class ResignTracker implements IXposedHookLoadPackage, IXposedHookZygoteI
                 return -1;
             }
         }
-    }
-
-    static void extractSo(File out) throws Exception {
-        ZipFile zf = new ZipFile(MODULE_PATH);
-        try {
-            ZipEntry e = zf.getEntry("lib/arm64-v8a/libresign.so");
-            if (e == null) throw new IllegalStateException("libresign.so not in apk");
-            InputStream is = zf.getInputStream(e);
-            FileOutputStream os = new FileOutputStream(out);
-            byte[] buf = new byte[65536]; int r;
-            while ((r = is.read(buf)) > 0) os.write(buf, 0, r);
-            os.flush(); os.close(); is.close();
-        } finally { zf.close(); }
-        out.setReadable(true, false);
-        out.setExecutable(true, false);
     }
 
     static String readText(File f) throws Exception {

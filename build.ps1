@@ -19,20 +19,37 @@
   手动指定 android.jar 路径（覆盖自动探测）
 
 .PARAMETER Keystore
-  手动指定签名用 keystore 文件路径（覆盖自动探测 / 自动生成）
+  手动指定签名用 keystore 文件路径（覆盖自动探测 / 自动生成；也支持环境变量 KEYSTORE）
+
+.PARAMETER KeystorePass
+  keystore 密码（默认取环境变量 KEYSTORE_PASS 或 android）
+
+.PARAMETER KeyAlias
+  签名密钥别名（默认取环境变量 KEY_ALIAS 或 androiddebugkey）
+
+.PARAMETER KeyPass
+  签名密钥密码（默认取环境变量 KEY_PASS，否则同 KeystorePass）
 
 .EXAMPLE
   ./build.ps1
   ./build.ps1 -NdkPath D:\android-ndk-r26d
 #>
 param(
-  [string]$NdkPath    = '',
-  [string]$SdkRoot    = '',
-  [string]$JdkHome    = '',
-  [string]$AndroidJar = '',
-  [string]$Keystore   = ''
+  [string]$NdkPath      = '',
+  [string]$SdkRoot      = '',
+  [string]$JdkHome      = '',
+  [string]$AndroidJar   = '',
+  [string]$Keystore     = '',
+  [string]$KeystorePass = '',
+  [string]$KeyAlias     = '',
+  [string]$KeyPass      = ''
 )
 $ErrorActionPreference = 'Stop'
+
+if (-not $Keystore -and $env:KEYSTORE) { $Keystore = $env:KEYSTORE }
+if (-not $KeystorePass) { $KeystorePass = if ($env:KEYSTORE_PASS) { $env:KEYSTORE_PASS } else { 'android' } }
+if (-not $KeyAlias)     { $KeyAlias     = if ($env:KEY_ALIAS)     { $env:KEY_ALIAS }     else { 'androiddebugkey' } }
+if (-not $KeyPass)      { $KeyPass      = if ($env:KEY_PASS)      { $env:KEY_PASS }      else { $KeystorePass } }
 
 # ── 0. 项目根目录（相对路径） ──────────────────────────────────────────
 $PROJ = $PSScriptRoot
@@ -89,9 +106,8 @@ function Find-SdkRoot {
   $candidates = @(
     (Join-Path $env:LOCALAPPDATA 'Android\Sdk'),
     'C:\Android\Sdk',
-    (Join-Path $env:HOME 'Android\Sdk'),
+    $(if ($env:HOME) { Join-Path $env:HOME 'Android\Sdk' }),
     (Join-Path $env:USERPROFILE 'Tools\androidsdk'),
-    'C:\Android\Sdk',
     'D:\Android\Sdk'
   )
   foreach ($c in $candidates) {
@@ -252,9 +268,9 @@ function Find-OrCreate-Keystore {
   Write-Host "Generating debug keystore at $localKs ..."
   & $keytool -genkeypair -v `
       -keystore $localKs `
-      -storepass android `
-      -alias androiddebugkey `
-      -keypass android `
+      -storepass $KeystorePass `
+      -alias $KeyAlias `
+      -keypass $KeyPass `
       -keyalg RSA `
       -keysize 2048 `
       -validity 10000 `
@@ -267,7 +283,7 @@ function Find-OrCreate-Keystore {
 }
 
 $KS = Find-OrCreate-Keystore
-"Keystore = $KS"
+"Keystore = $KS (alias=$KeyAlias)"
 
 # ── 构建开始 ──────────────────────────────────────────────────────────
 
@@ -279,33 +295,21 @@ if ($clangpp) {
   $njni = "$PROJ\native\jni"
   & $clangpp --target=aarch64-linux-android24 -fPIC -shared -O2 -fvisibility=hidden -fno-rtti -fno-exceptions -mno-outline-atomics -static-libstdc++ `
       '-Wl,-z,now' '-Wl,-z,relro' '-Wl,-z,noexecstack' '-Wl,--no-undefined' '-Wl,--pack-dyn-relocs=none' '-Wl,--hash-style=both' `
-      -o "$build\libantirecall.so" "$njni\antirecall.cpp" "$njni\And64InlineHook.cpp" -llog -ldl -lm
+      -o "$build\libantirecall.so" "$njni\antirecall.cpp" "$njni\resign.cpp" "$njni\And64InlineHook.cpp" -llog -ldl -lm
   if ($LASTEXITCODE) { throw "ndk compile libantirecall failed" }
-  # 额外编 libresign.so (离职统计用; 与 build.sh 一致)
-  & $clangpp --target=aarch64-linux-android24 -fPIC -shared -O2 -fvisibility=hidden -fno-rtti -fno-exceptions -mno-outline-atomics -static-libstdc++ `
-      '-Wl,-z,now' '-Wl,-z,relro' '-Wl,-z,noexecstack' '-Wl,--no-undefined' '-Wl,--pack-dyn-relocs=none' '-Wl,--hash-style=both' `
-      -o "$build\libresign.so" "$njni\resign.cpp" "$njni\And64InlineHook.cpp" -llog -ldl -lm
-  if ($LASTEXITCODE) { throw "ndk compile libresign failed" }
-  "libresign.so = $([math]::Round((Get-Item "$build\libresign.so").Length/1KB,1))KB"
 } else {
-  Write-Host "`n== 0. (NDK 缺失) 复用发布版 APK 里的全部 native 库 (libantirecall.so + libresign.so 等) =="
-  # 注意: 构建产物与旧 APK 同名(feishu-antirecall.apk), 直接复用会在首次构建时覆盖掉原始 so。
-  #       优先用 tools/native-v163.apk(原始发布版快照), 没有才退回根目录 APK。
-  $releaseApk = Join-Path $PROJ 'tools\native-v163.apk'
-  if (-not (Test-Path $releaseApk)) { $releaseApk = Join-Path $PROJ 'feishu-antirecall.apk' }
-  if (-not (Test-Path $releaseApk)) { throw "NDK 未装且找不到 native 库来源(tools/native-v163.apk 或 feishu-antirecall.apk)" }
+  Write-Host "`n== 0. (NDK 缺失) 复用现有 feishu-antirecall.apk 里的 libantirecall.so =="
+  $releaseApk = Join-Path $PROJ 'feishu-antirecall.apk'
+  if (-not (Test-Path $releaseApk)) { throw "NDK 未装且找不到可复用的 feishu-antirecall.apk" }
   Write-Host "  so 来源: $releaseApk"
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   $src = [System.IO.Compression.ZipFile]::OpenRead($releaseApk)
   try {
-    # 提取 lib/arm64-v8a/ 下所有 .so: 漏掉任何一个(如 libresign.so)都会让对应功能线程启动即死
-    $soEntries = $src.Entries | Where-Object { $_.FullName -like 'lib/arm64-v8a/*.so' }
-    if (-not $soEntries) { throw "no .so under lib/arm64-v8a/ in $releaseApk" }
-    foreach ($e in $soEntries) {
-      $out = Join-Path $build (Split-Path -Leaf $e.FullName)
-      [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, $out, $true)
-      Write-Host "  复用 $($e.FullName) -> $out"
-    }
+    $soEntry = $src.GetEntry('lib/arm64-v8a/libantirecall.so')
+    if (-not $soEntry) { throw "no lib/arm64-v8a/libantirecall.so in $releaseApk" }
+    $out = Join-Path $build 'libantirecall.so'
+    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($soEntry, $out, $true)
+    Write-Host "  复用 $($soEntry.FullName) -> $out"
   } finally { $src.Dispose() }
 }
 "libantirecall.so = $([math]::Round((Get-Item "$build\libantirecall.so").Length/1KB,1))KB"
@@ -328,9 +332,9 @@ $classFiles = Get-ChildItem "$build\app" -Recurse -Filter *.class | ForEach-Obje
 $classFiles | Set-Content -Encoding ascii "$build\d8_args.txt"
 $r8Jar = Join-Path $PROJ 'tools\r8.jar'
 if (Test-Path $r8Jar) {
-  & $java -cp $r8Jar com.android.tools.r8.D8 --min-api 22 --no-desugaring --output "$build" "@$build\d8_args.txt"
+  & $java -cp $r8Jar com.android.tools.r8.D8 --min-api 24 --no-desugaring --output "$build" "@$build\d8_args.txt"
 } else {
-  & $d8 --min-api 22 --no-desugaring --output "$build" "@$build\d8_args.txt"
+  & $d8 --min-api 24 --no-desugaring --output "$build" "@$build\d8_args.txt"
 }
 if ($LASTEXITCODE) { throw "d8 failed" }
 
@@ -340,7 +344,7 @@ if ($LASTEXITCODE) { throw "aapt2 compile failed" }
 & $aapt2 link -o "$build\app-unsigned.apk" -I "$AndroidJar" `
     --manifest "$PROJ\app\src\main\AndroidManifest.xml" `
     -A "$PROJ\app\src\main\assets" `
-    --min-sdk-version 22 --target-sdk-version 34 `
+    --min-sdk-version 24 --target-sdk-version 34 `
     "$build\res.zip"
 if ($LASTEXITCODE) { throw "aapt2 link failed" }
 
@@ -352,10 +356,6 @@ try {
   [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, "$build\classes.dex", 'classes.dex') | Out-Null
   $oldso = $zip.GetEntry('lib/arm64-v8a/libantirecall.so'); if ($oldso) { $oldso.Delete() }
   [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, "$build\libantirecall.so", 'lib/arm64-v8a/libantirecall.so') | Out-Null
-  if (Test-Path "$build\libresign.so") {
-    $oldso2 = $zip.GetEntry('lib/arm64-v8a/libresign.so'); if ($oldso2) { $oldso2.Delete() }
-    [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, "$build\libresign.so", 'lib/arm64-v8a/libresign.so') | Out-Null
-  }
 } finally { $zip.Dispose() }
 
 Write-Host "`n== 6. zipalign =="
@@ -363,7 +363,7 @@ Write-Host "`n== 6. zipalign =="
 if ($LASTEXITCODE) { throw "zipalign failed" }
 
 Write-Host "`n== 7. apksigner sign =="
-& $apksigner sign --ks "$KS" --ks-pass pass:android --ks-key-alias androiddebugkey --key-pass pass:android --out "$PROJ\feishu-antirecall.apk" "$build\app-aligned.apk"
+& $apksigner sign --ks "$KS" --ks-pass "pass:$KeystorePass" --ks-key-alias "$KeyAlias" --key-pass "pass:$KeyPass" --out "$PROJ\feishu-antirecall.apk" "$build\app-aligned.apk"
 if ($LASTEXITCODE) { throw "apksigner failed" }
 
 Write-Host "`n== DONE =="

@@ -7,8 +7,8 @@ import android.content.Intent;
 import android.net.Uri;
 import android.widget.Toast;
 
-import org.json.JSONObject;
 import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -25,6 +25,8 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -38,8 +40,16 @@ public final class DataMigration {
     private static final int REQ_IMPORT = 0x6F32;
     private static final long MAX_BACKUP_BYTES = 32L * 1024L * 1024L;
     private static final int BUF_SIZE = 32 * 1024;
+    private static final Pattern UID_PATTERN = Pattern.compile("[A-Za-z0-9_-]+");
+    private static final Pattern LEGACY_KICKED_PATTERN = Pattern.compile("kicked_[A-Za-z0-9_-]+\\.txt");
+    private static final Pattern ACCOUNT_KICKED_PATTERN = Pattern.compile("kicked_[0-9]+\\.txt");
+    private static final Pattern RECALL_MARKS_FILE_PATTERN = Pattern.compile("[0-9]+\\.marks");
+    private static final Pattern RECALL_MARKS_PATH_PATTERN = Pattern.compile("recall_marks/[0-9]+\\.marks");
+    private static final Pattern ACCOUNT_PATH_PATTERN = Pattern.compile(
+            "accounts/[A-Za-z0-9_-]+/(resign_tracker/(profiles|resigned_all|resigned_latest)\\.json|notif_archive\\.txt|leave_log\\.txt|kicked_[0-9]+\\.txt)");
+
     private static volatile boolean installed;
-    private static volatile int pendingRequest;
+    private static final AtomicInteger pendingRequest = new AtomicInteger(0);
 
     private DataMigration() {}
 
@@ -50,20 +60,28 @@ public final class DataMigration {
             XposedBridge.hookAllMethods(Activity.class, "onActivityResult", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     int request = (Integer) p.args[0];
-                    if ((request != REQ_EXPORT && request != REQ_IMPORT) || request != pendingRequest) return;
-                    pendingRequest = 0;
                     int result = (Integer) p.args[1];
                     Intent data = (Intent) p.args[2];
-                    if (result != Activity.RESULT_OK || data == null || data.getData() == null) return;
                     Activity activity = (Activity) p.thisObject;
-                    if (request == REQ_EXPORT) exportAsync(activity, data.getData());
-                    else importAsync(activity, data.getData());
+                    handleActivityResult(activity, request, result, data);
                 }
             });
         } catch (Throwable t) {
             installed = false;
-            XposedBridge.log("[fucklark] migration result hook failed: " + t);
+            logWarn("migration result hook failed", t);
         }
+    }
+
+    /** Handles SAF export/import results from either LauncherActivity or the hooked host Activity. */
+    public static boolean handleActivityResult(Activity activity, int requestCode, int resultCode, Intent data) {
+        if (requestCode != REQ_EXPORT && requestCode != REQ_IMPORT) return false;
+        if (!pendingRequest.compareAndSet(requestCode, 0)) return false;
+        if (activity == null || resultCode != Activity.RESULT_OK || data == null || data.getData() == null) {
+            return true;
+        }
+        if (requestCode == REQ_EXPORT) exportAsync(activity, data.getData());
+        else importAsync(activity, data.getData());
+        return true;
     }
 
     public static void chooseExport(Context context) {
@@ -75,10 +93,10 @@ public final class DataMigration {
             i.setType("application/zip");
             String day = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
             i.putExtra(Intent.EXTRA_TITLE, "FeishuKit-backup-" + day + ".zip");
-            pendingRequest = REQ_EXPORT;
+            pendingRequest.set(REQ_EXPORT);
             activity.startActivityForResult(i, REQ_EXPORT);
         } catch (Throwable t) {
-            pendingRequest = 0;
+            pendingRequest.compareAndSet(REQ_EXPORT, 0);
             toast(context, "打开导出位置失败: " + safeMessage(t));
         }
     }
@@ -90,10 +108,10 @@ public final class DataMigration {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
             i.setType("application/zip");
-            pendingRequest = REQ_IMPORT;
+            pendingRequest.set(REQ_IMPORT);
             activity.startActivityForResult(i, REQ_IMPORT);
         } catch (Throwable t) {
-            pendingRequest = 0;
+            pendingRequest.compareAndSet(REQ_IMPORT, 0);
             toast(context, "打开备份文件失败: " + safeMessage(t));
         }
     }
@@ -108,8 +126,8 @@ public final class DataMigration {
                     ZipOutputStream zip = new ZipOutputStream(new BufferedOutputStream(raw));
                     try {
                         JSONObject manifest = new JSONObject();
-                        manifest.put("format", 1);
-                        manifest.put("moduleVersion", AntiRecall.MODULE_VERSION);
+                        manifest.put("format", 2);
+                        manifest.put("moduleVersion", ModuleBuild.VERSION);
                         manifest.put("createdAt", System.currentTimeMillis());
                         manifest.put("sourcePackage", activity.getPackageName());
                         putBytes(zip, "manifest.json", manifest.toString(2).getBytes("UTF-8"));
@@ -118,7 +136,7 @@ public final class DataMigration {
                     } finally { zip.close(); }
                     done(activity, "备份完成，共 " + files.size() + " 个数据文件");
                 } catch (Throwable t) {
-                    XposedBridge.log("[fucklark] export backup failed: " + t);
+                    logWarn("export backup failed", t);
                     done(activity, "备份失败: " + safeMessage(t));
                 }
             }
@@ -136,7 +154,8 @@ public final class DataMigration {
                     Set<String> extracted = extractValidated(raw, stage);
                     if (!extracted.contains("manifest.json")) throw new Exception("不是有效的 FeishuKit 备份");
                     JSONObject manifest = new JSONObject(readText(new File(stage, "manifest.json")));
-                    if (manifest.optInt("format", 0) != 1) throw new Exception("不支持的备份格式");
+                    int format = manifest.optInt("format", 0);
+                    if (format != 1 && format != 2) throw new Exception("不支持的备份格式");
                     validateJsonFiles(stage, extracted);
                     File root = activity.getFilesDir();
                     int restored = 0;
@@ -147,27 +166,71 @@ public final class DataMigration {
                     }
                     Config.setFilesDir(root);
                     Config.load();
+                    Config.syncAfterRestore(activity);
+                    if (!Config.MODULE_PKG.equals(activity.getPackageName())) {
+                        try { ArchiveSync.pushAll(); } catch (Throwable ignored) {}
+                    }
                     done(activity, "恢复完成，共 " + restored + " 个数据文件；建议重启飞书");
                 } catch (Throwable t) {
-                    XposedBridge.log("[fucklark] import backup failed: " + t);
+                    logWarn("import backup failed", t);
                     done(activity, "恢复失败，未通过校验: " + safeMessage(t));
                 } finally { deleteTree(stage); }
             }
         }, "fucklark-backup-import").start();
     }
 
-    private static List<FileItem> collect(File root) {
+    static List<FileItem> collect(File root) {
         List<FileItem> out = new ArrayList<FileItem>();
+        if (root == null || !root.isDirectory()) return out;
         addIfFile(out, root, "fucklark_cfg.json");
+        addIfFile(out, root, "block_log.json");
         addIfFile(out, root, "notif_archive.txt");
         addIfFile(out, root, "leave_log.txt");
         File[] top = root.listFiles();
-        if (top != null) for (File f : top) {
-            if (f.isFile() && f.getName().startsWith("kicked_") && f.getName().endsWith(".txt"))
-                out.add(new FileItem(f, f.getName()));
+        if (top != null) {
+            for (File f : top) {
+                if (f.isFile() && LEGACY_KICKED_PATTERN.matcher(f.getName()).matches()) {
+                    out.add(new FileItem(f, f.getName()));
+                }
+            }
         }
         addIfFile(out, root, "resign_tracker/resigned_all.json");
+        addIfFile(out, root, "resign_tracker/resigned_latest.json");
         addIfFile(out, root, "resign_tracker/profiles.json");
+
+        File accountsDir = new File(root, "accounts");
+        File[] accountDirs = accountsDir.isDirectory() ? accountsDir.listFiles() : null;
+        if (accountDirs != null) {
+            for (File accDir : accountDirs) {
+                if (!accDir.isDirectory()) continue;
+                String uid = accDir.getName();
+                if (!UID_PATTERN.matcher(uid).matches()) continue;
+                String prefix = "accounts/" + uid + "/";
+                addIfFile(out, root, prefix + "resign_tracker/profiles.json");
+                addIfFile(out, root, prefix + "resign_tracker/resigned_all.json");
+                addIfFile(out, root, prefix + "resign_tracker/resigned_latest.json");
+                addIfFile(out, root, prefix + "notif_archive.txt");
+                addIfFile(out, root, prefix + "leave_log.txt");
+                File[] accFiles = accDir.listFiles();
+                if (accFiles != null) {
+                    for (File f : accFiles) {
+                        if (f.isFile() && ACCOUNT_KICKED_PATTERN.matcher(f.getName()).matches()) {
+                            out.add(new FileItem(f, prefix + f.getName()));
+                        }
+                    }
+                }
+            }
+        }
+
+        File marksDir = new File(root, "recall_marks");
+        File[] markFiles = marksDir.isDirectory() ? marksDir.listFiles() : null;
+        if (markFiles != null) {
+            for (File f : markFiles) {
+                if (f.isFile() && RECALL_MARKS_FILE_PATTERN.matcher(f.getName()).matches()) {
+                    out.add(new FileItem(f, "recall_marks/" + f.getName()));
+                }
+            }
+        }
         return out;
     }
 
@@ -176,17 +239,31 @@ public final class DataMigration {
         if (f.isFile()) out.add(new FileItem(f, path));
     }
 
-    private static boolean allowed(String path) {
-        if ("manifest.json".equals(path) || "fucklark_cfg.json".equals(path)
-                || "notif_archive.txt".equals(path) || "leave_log.txt".equals(path)
+    static boolean allowed(String path) {
+        if (path == null || path.isEmpty() || path.startsWith("/")
+                || path.indexOf('\\') >= 0 || path.contains("..")) {
+            return false;
+        }
+        if ("manifest.json".equals(path)
+                || "fucklark_cfg.json".equals(path)
+                || "block_log.json".equals(path)
+                || "notif_archive.txt".equals(path)
+                || "leave_log.txt".equals(path)
                 || "resign_tracker/resigned_all.json".equals(path)
                 || "resign_tracker/resigned_latest.json".equals(path)
-                || "resign_tracker/profiles.json".equals(path)) return true;
-        return path.startsWith("kicked_") && path.endsWith(".txt") && path.indexOf('/') < 0;
+                || "resign_tracker/profiles.json".equals(path)) {
+            return true;
+        }
+        if (LEGACY_KICKED_PATTERN.matcher(path).matches()) return true;
+        if (RECALL_MARKS_PATH_PATTERN.matcher(path).matches()) return true;
+        if (ACCOUNT_PATH_PATTERN.matcher(path).matches()) return true;
+        return false;
     }
 
-    private static Set<String> extractValidated(InputStream raw, File stage) throws Exception {
+    static Set<String> extractValidated(InputStream raw, File stage) throws Exception {
         Set<String> names = new HashSet<String>();
+        String stageCanonical = stage.getCanonicalPath();
+        if (!stageCanonical.endsWith(File.separator)) stageCanonical += File.separator;
         ZipInputStream zip = new ZipInputStream(new BufferedInputStream(raw));
         long total = 0;
         byte[] buf = new byte[BUF_SIZE];
@@ -195,9 +272,11 @@ public final class DataMigration {
             while ((e = zip.getNextEntry()) != null) {
                 String name = e.getName().replace('\\', '/');
                 if (e.isDirectory()) continue;
-                if (!allowed(name) || name.startsWith("/") || name.contains("../") || !names.add(name))
+                if (!allowed(name) || name.startsWith("/") || name.contains("..") || !names.add(name))
                     throw new Exception("备份包含非法文件: " + name);
                 File dst = new File(stage, name);
+                if (!dst.getCanonicalPath().startsWith(stageCanonical))
+                    throw new Exception("备份包含非法路径: " + name);
                 File parent = dst.getParentFile();
                 if (parent != null && !parent.isDirectory() && !parent.mkdirs()) throw new Exception("无法创建临时目录");
                 OutputStream out = new BufferedOutputStream(new FileOutputStream(dst));
@@ -281,6 +360,11 @@ public final class DataMigration {
         a.runOnUiThread(new Runnable() { @Override public void run() { toast(a, text); } });
     }
 
+    private static void logWarn(String msg, Throwable t) {
+        try { android.util.Log.w("fucklark", msg, t); } catch (Throwable ignored) {}
+        try { XposedBridge.log("[fucklark] " + msg + ": " + t); } catch (Throwable ignored) {}
+    }
+
     private static void toast(Context c, String text) { Toast.makeText(c, text, Toast.LENGTH_LONG).show(); }
     private static String safeMessage(Throwable t) { return t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage(); }
     private static void deleteTree(File f) {
@@ -290,7 +374,7 @@ public final class DataMigration {
         f.delete();
     }
 
-    private static final class FileItem {
+    static final class FileItem {
         final File file; final String path;
         FileItem(File file, String path) { this.file = file; this.path = path; }
     }

@@ -58,6 +58,11 @@ final class RecallMessages {
             new java.util.concurrent.ConcurrentHashMap<Class<?>, Method>();
     private static final Map<Class<?>, Method> CHAT_ID_GETTERS =
             new java.util.concurrent.ConcurrentHashMap<Class<?>, Method>();
+    private static final Method NO_METHOD = resolveNoMethodSentinel();
+    private static Method resolveNoMethodSentinel() {
+        try { return Object.class.getMethod("toString"); }
+        catch (Throwable t) { throw new AssertionError(t); }
+    }
     private static final java.util.Set<Class<?>> CONTENT_HOOKS =
             java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<Class<?>, Boolean>());
     private static final ThreadLocal<Boolean> CONTENT_CAPTURE = new ThreadLocal<Boolean>();
@@ -159,6 +164,7 @@ final class RecallMessages {
         Class<?> type = message.getClass();
         Map<Class<?>, Method> cache = "getId".equals(semantic) ? MESSAGE_ID_GETTERS : CHAT_ID_GETTERS;
         Method getter = cache.get(type);
+        if (getter == NO_METHOD) return fallback == null ? "" : fallback;
         if (getter == null) {
             String[] aliases = "getId".equals(semantic)
                     ? new String[]{"getMessageId"} : new String[]{"getConversationId", "getChatID"};
@@ -191,13 +197,12 @@ final class RecallMessages {
                 Diag.once("[fucklark] message identity getter matched: "
                         + type.getName() + "#" + getter.getName() + " semantic=" + semantic);
             } else {
+                cache.put(type, NO_METHOD);
                 Diag.once("[fucklark] message identity getter unavailable: "
                         + type.getName() + " semantic=" + semantic);
             }
         }
-        if (getter == null) return fallback == null ? "" : fallback;
-        if ("getId".equals(semantic)) MESSAGE_ID_GETTERS.put(type, getter);
-        else CHAT_ID_GETTERS.put(type, getter);
+        if (getter == null || getter == NO_METHOD) return fallback == null ? "" : fallback;
         try {
             Object raw = getter.invoke(message);
             return raw == null ? "" : String.valueOf(raw);
@@ -364,7 +369,7 @@ final class RecallMessages {
     /** Getter Hook passes its already-read value so this path never calls the hooked getter recursively. */
     static Object prepareContent(Object message, Object currentContent) {
         if (Boolean.TRUE.equals(CONTENT_CAPTURE.get())) return currentContent;
-        if (message == null || !Config.antirecall || AntiRecall.TAMPER == 2) return currentContent;
+        if (message == null || !Config.antirecall) return currentContent;
         // getContent is called repeatedly while rows render. Bound messages are
         // captured separately, so ordinary messages need only this cheap status check.
         if (!messageRecalled(message)) return currentContent;
@@ -528,20 +533,21 @@ final class RecallMessages {
     }
 
     private static Object prepare(String uid, Object message, Object currentContent, boolean contentProvided) {
-        if (message == null || !Config.antirecall
-                || AntiRecall.TAMPER == 2) return currentContent;
+        if (message == null || !Config.antirecall) return currentContent;
         try {
             String chat = messageText(message, "getChatId", ""), id = messageText(message, "getId", "");
             String key = key(uid, chat, id);
             if (key == null) return currentContent;
             String sender = senderId(message, uid, chat, id);
-            // isFromMe=false 和发送者 UID!=当前账号必须同时成立；任一字段不可信，
-            // 就不保存/回填原文，让宿主与 native 按原有策略处理。
-            if (messageFromMe(message, uid, chat, id)) {
-                synchronized (contents) { contents.remove(key); }
-                return currentContent;
+            // 发送者 UID!=当前账号且非自己发送必须同时成立；仅在 sender 无法解析时回退 isFromMe()。
+            boolean fromMe;
+            if (positive(sender) > 0) {
+                fromMe = uid.equals(sender);
+            } else {
+                try { fromMe = Boolean.TRUE.equals(XposedHelpers.callMethod(message, "isFromMe")); }
+                catch (Throwable ignored) { fromMe = false; }
             }
-            if (positive(sender) == 0 || uid.equals(sender)) {
+            if (fromMe || positive(sender) == 0) {
                 synchronized (contents) { contents.remove(key); }
                 return currentContent;
             }

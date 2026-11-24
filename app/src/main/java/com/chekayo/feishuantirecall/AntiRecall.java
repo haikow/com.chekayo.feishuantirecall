@@ -59,12 +59,13 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
 
     // 签名自校验: 运行 APK 的证书 SHA-256(=SHA256(signature.toByteArray()))。重打包必须重签名 -> 证书变 -> 检测到篡改。
     static final String EXPECTED_SIG = "0cc1410f036279be41e112726687480a92e9f0a3bb5bfae09c9a23c4a764ccfd";
-    // 0=未判定, 1=正版, 2=被篡改(重签名)。篡改则禁用核心功能(防撤回/防已读) + 面板告警。
-    static volatile int TAMPER = 0;
+    // 0=未判定, 1=正版, 2=非官方签名构建（自编译或重打包；非阻断，仅面板温和提示并隐藏赞赏入口）。
+    public static volatile int TAMPER = 0;
     // 归档证书解析只做一次；PackageManager 在部分 ROM 上解析模块 APK 很慢或会抛错。
     private static volatile int SIGNATURE_STATE = 0; // 0=未检查，1=可信/读取失败放行，2=证书不匹配
 
     static volatile String MODULE_PATH = null;
+    private static volatile boolean NATIVE_LIB_LOADED = false;
     static volatile boolean NATIVE_STARTED = false;
 
     /** JNI: 尝试安装一次 sqlite3_step inline hook; true=已装好或库缺符号(停止), false=库未加载(继续重试). */
@@ -85,6 +86,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     /** JNI: UI 从已提交标记快照查询，不在主线程访问 SQLite 连接。 */
     public static native boolean nativeIsRecallMarked(String uid, long chat, long id);
     public static native void nativeBindRecallAccount(String uid, String storage);
+    /** JNI: 已提交撤回标记的单调代际计数，变化时唤醒气泡 UI 刷新。 */
+    public static native long nativeRecallEpoch();
 
     /** JNI: 诊断日志开关 (关=native flog 完全不写文件). */
     public static native void nativeSetDiag(boolean on);
@@ -142,22 +145,24 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     static void bindConfigBridge(final android.content.Context c) {
         try {
             Config.setContext(c);
+            final boolean isMain = PKG.equals(currentProcessName());
             android.content.BroadcastReceiver receiver = new android.content.BroadcastReceiver() {
                 @Override public void onReceive(android.content.Context x, android.content.Intent i) {
                     String act = i.getAction();
                     if (Config.ACTION_SYNC.equals(act)) {
                         Config.onSyncReceive(i.getStringExtra("json"));
-                        RecallBubbleUi.schedule();
-                        try {
-                            nativeSetRecall(Config.antirecall);
-
-                            nativeSetKeepKicked(Config.keepkicked);
-                            nativeSetDiag(Config.diaglog);
-                            nativeSetLeaveNotify(Config.leavenotify);
-                        } catch (Throwable ignored) {}
-                    } else if (ArchiveSync.ACTION_REFRESH.equals(act)) {
+                        if (isMain) {
+                            RecallBubbleUi.schedule();
+                            try {
+                                nativeSetRecall(Config.antirecall);
+                                nativeSetKeepKicked(Config.keepkicked);
+                                nativeSetDiag(Config.diaglog);
+                                nativeSetLeaveNotify(Config.leavenotify);
+                            } catch (Throwable ignored) {}
+                        }
+                    } else if (isMain && ArchiveSync.ACTION_REFRESH.equals(act)) {
                         com.chekayo.larkresign.ResignTracker.requestRefresh("桌面刷新请求");
-                    } else if (ArchiveSync.ACTION_PULL.equals(act)) {
+                    } else if (isMain && ArchiveSync.ACTION_PULL.equals(act)) {
                         // 桌面入口请求档案副本 → 推 profiles + 离职名单
                         ArchiveSync.pushAll();
                     }
@@ -165,17 +170,22 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
             };
             android.content.IntentFilter syncFilter = new android.content.IntentFilter();
             syncFilter.addAction(Config.ACTION_SYNC);
-            syncFilter.addAction(ArchiveSync.ACTION_PULL);
-            syncFilter.addAction(ArchiveSync.ACTION_REFRESH);
+            if (isMain) {
+                syncFilter.addAction(ArchiveSync.ACTION_PULL);
+                syncFilter.addAction(ArchiveSync.ACTION_REFRESH);
+            }
             // 必须 EXPORTED：发送方是模块桌面进程（另一 UID），NOT_EXPORTED 会收不到
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 c.registerReceiver(receiver, syncFilter, android.content.Context.RECEIVER_EXPORTED);
             } else {
                 c.registerReceiver(receiver, syncFilter);
             }
-            XposedBridge.log("[fucklark] config bridge bound pkg=" + c.getPackageName());
-            // Context 就绪后再与模块权威源对齐一次（handleLoadPackage 早期可能 context 还是 null）
-            try { Config.loadAndAnnounce(); Config.startPolling(); } catch (Throwable ignored) {}
+            XposedBridge.log("[fucklark] config bridge bound pkg=" + c.getPackageName() + " main=" + isMain);
+            // Context 就绪后再与模块权威源对齐一次；仅主进程启动定时轮询，避免子进程反复冲击 ConfigProvider
+            try {
+                Config.loadAndAnnounce();
+                if (isMain) Config.startPolling();
+            } catch (Throwable ignored) {}
         } catch (Throwable t) {
             XposedBridge.log("[fucklark] config bridge bind failed: " + t);
         }
@@ -185,6 +195,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     public void handleLoadPackage(LoadPackageParam lpparam) {
         if (!isLarkFamily(lpparam.packageName) && !isLarkApp(lpparam.classLoader)) return;
         PKG = lpparam.packageName;
+        boolean isMain = PKG.equals(currentProcessName());
         installConfigBridge();   // 锁定当前目标(进程内唯一), 下游 dataDir/getPackageInfo 随之自适应
 
         // ---- 0) 后台消息存档: hook 通知抓正文(所有飞书进程都装) ----
@@ -199,6 +210,11 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
             try { Config.loadAndAnnounce(); } catch (Throwable ignored) {}
             installNotifHook();
         } catch (Throwable t) { XposedBridge.log("[fucklark] notif archive init failed: " + t); }
+
+        if (!isMain) return;
+
+        // ---- 0.4) 撤回系统提示文案策略（仅主进程，接入集中 ViewHookHub） ----
+        installRecallUiRestore();
 
         // ---- 0.5) 去除聊天水印: hook View.setForeground, 丢弃水印包的前景 drawable ----
         try { installWatermarkHook(); } catch (Throwable t) { XposedBridge.log("[fucklark] watermark init failed: " + t); }
@@ -217,16 +233,16 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         // ---- 0.65) 解除「保密模式」复制/转发限制: RestrictedMode 门禁拦截器 -> 全放行(按签名定位, 抗混淆) ----
         try { RestrictedModeUnlock.install(lpparam.classLoader); } catch (Throwable t) { XposedBridge.log("[fucklark] restricted-mode unlock init failed: " + t); }
 
-        // ---- 0.7) 主页顶部更新横幅: hook MainActivity.onResume, 有新版时注入横幅 ----
+        // ---- 0.7) 主页底部更新横幅: hook MainActivity.onResume, 有新版时注入横幅 ----
         try { UpdateBanner.install(lpparam.classLoader); } catch (Throwable t) { XposedBridge.log("[fucklark] update banner init failed: " + t); }
 
         // ---- 0.8) 下载文件另存到系统「下载」: 主进程监听 Lark/download, 写完即 MediaStore 复制到公共 Download ----
         try {
-            if (PKG.equals(currentProcessName())) installDownloadMirror();
+            installDownloadMirror();
         } catch (Throwable t) { XposedBridge.log("[fucklark] download mirror init failed: " + t); }
 
         // ---- 1) 防撤回三层独立安装：身份/Java 兜底、native SQL 拦截、原气泡标识 ----
-        if (PKG.equals(currentProcessName())) installRecall(lpparam.classLoader);
+        installRecall(lpparam.classLoader);
 
         // ---- 1.5) 防对方已读 (v2, Java 层): hook UpdateMessagesMeReadRequest 构造, 清空 message_ids/fold_ids ----
         // 桌面版做法的忠实移植: 已读上报命令 UPDATE_MESSAGES_ME_READ 携带 message_ids, 清空即"标零条已读".
@@ -234,8 +250,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         //   rustclient jk(UPDATE_MESSAGES_ME_READ, UpdateMessagesMeReadRequest{message_ids,max_position,...}).
         // pb 类名 com.bytedance.lark.pb.im.v1.UpdateMessagesMeReadRequest 稳定未混淆.
         try { installAntiRead2(lpparam.classLoader); } catch (Throwable t) { alog("antiread2 install failed: " + t); }
-        if (PKG.equals(currentProcessName())) ManualReadAction.install(lpparam.classLoader);
-        if (PKG.equals(currentProcessName())) ConversationSwipeRead.install(lpparam.classLoader);
+        ManualReadAction.install(lpparam.classLoader);
+        ConversationSwipeRead.install(lpparam.classLoader);
 
         // 7.x and 8.x share the runtime-discovered getter hook; no version-specific mapper.
         RecallMessages.enableDynamicContentRestore();
@@ -327,8 +343,6 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         } catch (Throwable t) {
             XposedBridge.log("[fucklark] notif hook install failed: " + t);
         }
-        // 同时挂 UI 还原: 撤回系统提示渲染时把存档原文拼回去
-        installRecallUiRestore();
     }
 
     /**
@@ -342,58 +356,40 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
 
     static void installRecallUiRestore() {
         try {
-            XC_MethodHook h = new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam p) {
+            ViewHookHub.addSetTextListener(new ViewHookHub.SetTextListener() {
+                @Override public void afterSetText(android.widget.TextView tv, CharSequence src) {
+                    if (src == null) return;
+                    if (!Config.antirecall || Config.recallDisplayMode != Config.RECALL_MODE_HINT) return;
+                    String s = src.toString();
+                    if (s.length() == 0 || !isRecallSystemText(s) || isOwnRecallNotice(s)) return;
+                    if (RECALL_UI_BUSY.contains(tv)) return;
+
+                    String sender = recallSenderFromUi(s);
+                    RECALL_UI_BUSY.add(tv);
                     try {
-                        CharSequence src = null;
-                        if (p.args != null && p.args.length > 0 && p.args[0] instanceof CharSequence) {
-                            src = (CharSequence) p.args[0];
+                        // 提示模式只显示提示，不用按发送人索引的旧通知内容覆盖历史撤回。
+                        if (!Config.showRecallHint) {
+                            tv.setVisibility(android.view.View.GONE);
+                            tv.setHeight(0);
+                            return;
                         }
-                        if (src == null) return;
-                        String s = src.toString();
-                        if (s == null || s.length() == 0) return;
-                        if (!Config.antirecall || Config.recallDisplayMode != Config.RECALL_MODE_HINT
-                                || !isRecallSystemText(s) || isOwnRecallNotice(s)) return;
-
-                        android.widget.TextView tv = (android.widget.TextView) p.thisObject;
-                        if (RECALL_UI_BUSY.contains(tv)) return;
-                        try { Config.load(); } catch (Throwable ignored) {}
-
-                        String sender = recallSenderFromUi(s);
-                        RECALL_UI_BUSY.add(tv);
-                        try {
-                            // 提示模式只显示提示，不用按发送人索引的旧通知内容覆盖历史撤回。
-                            if (!Config.showRecallHint) {
-                                tv.setVisibility(android.view.View.GONE);
-                                tv.setHeight(0);
-                                return;
-                            }
-                            tv.setVisibility(android.view.View.VISIBLE);
-                            fixRecallRowHeight(tv);
-                            String hint = Config.recallHintText;
-                            if (hint == null || hint.trim().isEmpty()) hint = "撤回了一条消息";
-                            String name = sender == null ? "" : sender.trim();
-                            if (hint.contains("{name}") || hint.contains("{sender}")) {
-                                hint = hint.replace("{name}", name).replace("{sender}", name);
-                            } else if (!name.isEmpty() && !hint.startsWith(name)) {
-                                hint = name + hint;
-                            }
-                            if (!hint.equals(s)) tv.setText(hint);
-                        } finally {
-                            RECALL_UI_BUSY.remove(tv);
+                        tv.setVisibility(android.view.View.VISIBLE);
+                        fixRecallRowHeight(tv);
+                        String hint = Config.recallHintText;
+                        if (hint == null || hint.trim().isEmpty()) hint = "撤回了一条消息";
+                        String name = sender == null ? "" : sender.trim();
+                        if (hint.contains("{name}") || hint.contains("{sender}")) {
+                            hint = hint.replace("{name}", name).replace("{sender}", name);
+                        } else if (!name.isEmpty() && !hint.startsWith(name)) {
+                            hint = name + hint;
                         }
-                    } catch (Throwable ignored) {}
+                        if (!hint.equals(s)) tv.setText(hint);
+                    } finally {
+                        RECALL_UI_BUSY.remove(tv);
+                    }
                 }
-            };
-            try {
-                XposedHelpers.findAndHookMethod(android.widget.TextView.class, "setText",
-                        CharSequence.class, android.widget.TextView.BufferType.class, h);
-            } catch (Throwable ignored) { }
-            try {
-                XposedHelpers.findAndHookMethod(android.widget.TextView.class, "setText",
-                        CharSequence.class, h);
-            } catch (Throwable ignored) { }
-            XposedBridge.log("[fucklark] 后台撤回 统计/还原/提示 已 hook (进程 " + currentProcessName() + ")");
+            });
+            XposedBridge.log("[fucklark] 后台撤回 提示策略已注册 (进程 " + currentProcessName() + ")");
         } catch (Throwable t) {
             XposedBridge.log("[fucklark] recall UI restore hook failed: " + t);
         }
@@ -492,46 +488,93 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         catch (Throwable t) { Diag.once("[fucklark] recall translation hook unavailable: " + t); XposedBridge.log("[fucklark] recall translation hook unavailable: " + t); }
     }
 
+    /**
+     * 提取并加载合并后的 libantirecall.so（含防撤回与离职统计 JNI）。
+     * CRC 缓存复用，原子替换，并自动清理旧版本残留 libantirecall-*.so。
+     */
+    public static synchronized boolean ensureNativeLoaded() {
+        if (NATIVE_LIB_LOADED) return true;
+        if (MODULE_PATH == null) {
+            XposedBridge.log("[antirecall] ensureNativeLoaded: MODULE_PATH null (initZygote not called)");
+            return false;
+        }
+        try {
+            File filesDir = larkFilesDir();
+            File dataDir = filesDir != null && filesDir.getParentFile() != null
+                    ? filesDir.getParentFile() : ProfilePaths.dataDir(PKG);
+            File outDir = new File(dataDir, "antirecall");
+            outDir.mkdirs();
+
+            File out;
+            ZipFile zf = new ZipFile(MODULE_PATH);
+            try {
+                ZipEntry library = zf.getEntry("lib/arm64-v8a/libantirecall.so");
+                if (library == null) throw new IllegalStateException("lib/arm64-v8a/libantirecall.so not in module apk");
+                // CRC 随库内容变化，即使版本号相同也不会继续加载旧库文件。
+                String targetName = "libantirecall-" + Long.toHexString(library.getCrc()) + ".so";
+                out = new File(outDir, targetName);
+                long expectedSize = library.getSize();
+                boolean cached = out.isFile() && expectedSize > 0 && out.length() == expectedSize;
+                if (!cached) {
+                    InputStream is = zf.getInputStream(library);
+                    File tmp = new File(outDir, "libantirecall.so.tmp." + android.os.Process.myPid());
+                    try {
+                        FileOutputStream os = new FileOutputStream(tmp);
+                        try {
+                            byte[] buf = new byte[65536];
+                            int r;
+                            while ((r = is.read(buf)) > 0) os.write(buf, 0, r);
+                            os.flush();
+                            os.getFD().sync();
+                        } finally {
+                            os.close();
+                        }
+                    } finally {
+                        is.close();
+                    }
+                    if (out.exists() && !out.delete()) {
+                        tmp.delete();
+                        throw new IllegalStateException("cannot replace old native library");
+                    }
+                    if (!tmp.renameTo(out)) {
+                        tmp.delete();
+                        throw new IllegalStateException("cannot publish native library");
+                    }
+                    out.setReadable(true, false);
+                    out.setExecutable(true, false);
+                }
+                File[] existing = outDir.listFiles();
+                if (existing != null) {
+                    for (File f : existing) {
+                        String n = f.getName();
+                        if (n.startsWith("libantirecall-") && n.endsWith(".so") && !n.equals(targetName)) {
+                            try { f.delete(); } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            } finally {
+                zf.close();
+            }
+
+            System.load(out.getAbsolutePath());
+            NATIVE_LIB_LOADED = true;
+            XposedBridge.log("[antirecall] native lib loaded: " + out.getAbsolutePath());
+            return true;
+        } catch (Throwable t) {
+            XposedBridge.log("[antirecall] ensureNativeLoaded failed: " + t);
+            return false;
+        }
+    }
+
     static synchronized void startNative() throws Exception {
         if (NATIVE_STARTED) return;
         if (MODULE_PATH == null) throw new IllegalStateException("module path null (initZygote not called)");
-
-        File dataDir = ProfilePaths.dataDir(PKG);
-        File outDir = new File(dataDir, "antirecall");
-        outDir.mkdirs();
-        ZipFile zf = new ZipFile(MODULE_PATH);
-        ZipEntry library = zf.getEntry("lib/arm64-v8a/libantirecall.so");
-        if (library == null) { zf.close(); throw new IllegalStateException("native library missing"); }
-        // CRC 随库内容变化，即使版本号相同也不会继续加载旧库文件。
-        File out = new File(outDir, "libantirecall-" + Long.toHexString(library.getCrc()) + ".so");
-        try {
-            ZipEntry e = zf.getEntry("lib/arm64-v8a/libantirecall.so");
-            if (e == null) throw new IllegalStateException("lib/arm64-v8a/libantirecall.so not in module apk");
-            InputStream is = zf.getInputStream(e);
-            File tmp = new File(outDir, "libantirecall.so.tmp");
-            FileOutputStream os = new FileOutputStream(tmp);
-            byte[] buf = new byte[65536];
-            int r;
-            while ((r = is.read(buf)) > 0) os.write(buf, 0, r);
-            os.flush();
-            os.getFD().sync();
-            os.close();
-            is.close();
-            if (out.exists() && !out.delete()) throw new IllegalStateException("cannot replace old native library");
-            if (!tmp.renameTo(out)) throw new IllegalStateException("cannot publish native library");
-        } finally {
-            zf.close();
-        }
-        out.setReadable(true, false);
-        out.setExecutable(true, false);
-
-        System.load(out.getAbsolutePath());
+        if (!ensureNativeLoaded()) throw new IllegalStateException("native library load failed");
         NATIVE_STARTED = true;
-        XposedBridge.log("[antirecall] native lib loaded: " + out.getAbsolutePath());
 
         // 当前目标包的 files dir → 配置/日志/native 日志都按它走(国内/国际版自适应)。
         // 必须在 Config.load()/Diag.w() 之前, 否则它们用的还是 null 路径。
-        File filesDir = new File(dataDir, "files");
+        File filesDir = larkFilesDir();
         try {
             Config.setFilesDir(filesDir);
             Diag.setFilesDir(filesDir);
@@ -550,7 +593,6 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         } catch (Throwable t) {
             try { nativeSetDataDir(filesDir.getAbsolutePath()); } catch (Throwable ignored) {}
         }
-        try { nativeSetDataDir(AccountPaths.accountRoot(null, PKG, AccountPaths.currentUid).getAbsolutePath()); } catch (Throwable ignored) {}
 
         // FeishuKit: 读配置 + 与模块权威源对齐 + 按开关设防撤回/诊断状态
         // 注意: 不能只 load() 本地旧文件——会把刚同步到的配置冲掉
@@ -593,12 +635,11 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
             }
             if (ctx != null) Diag.w("飞书版本 = " + feishuVersion());
 
-            // ★ 签名自校验: 被重打包(重签名)则禁用核心功能, 不装 native hook。
+            // 签名自校验（非阻断）：自编译或重打包构建仅在面板显示提示并隐藏赞赏入口，核心功能仍正常启用。
             TAMPER = checkSignature(ctx) ? 1 : 2;
             if (TAMPER == 2) {
-                XposedBridge.log("[fucklark] 签名不匹配, 疑似被篡改/重打包 -> 禁用防撤回/防已读");
-                Diag.w("⚠️ 签名校验失败: 本模块被篡改/重打包, 已禁用核心功能。请从官方渠道重新下载。");
-                return;   // 不进入 native 安装循环 -> 无防撤回
+                XposedBridge.log("[fucklark] 检测到非官方签名构建（自编译或重打包），核心功能仍正常启用");
+                Diag.w("ℹ️ 当前为非官方签名构建（自编译或重打包），核心功能仍正常启用，赞赏入口已隐藏。");
             }
 
             for (int i = 0; i < 800; i++) {       // ~120s @150ms
@@ -607,12 +648,20 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     if (tryInstall()) {
                         XposedBridge.log("[antirecall] SQLite hook 安装成功：第 " + (i + 1) + " 次尝试，重试 " + i + " 次");
                         Diag.w("防撤回进度 1/3：SQLite 拦截钩子已安装；正在观察消息库，尚未证明已命中撤回写入");
-                        // 安装成功后转入维护循环: 周期重打被反篡改还原的 liblark hook + 轮询退群提醒.
+                        // 安装成功后转入维护循环: 周期维护 hook + 监听撤回代际变化 + 轮询退群提醒.
                         android.os.Handler mh = new android.os.Handler(android.os.Looper.getMainLooper());
+                        long lastRecallEpoch = -1;
                         while (true) {
-                            try { Thread.sleep(150); } catch (InterruptedException e) { return; }
+                            try { Thread.sleep(1500); } catch (InterruptedException e) { return; }
                             try { nativeMaintain(); } catch (Throwable e) { /* ignore */ }
                             try { RecallMessages.refreshAccount(); } catch (Throwable ignored) {}
+                            try {
+                                long epoch = nativeRecallEpoch();
+                                if (epoch != lastRecallEpoch) {
+                                    lastRecallEpoch = epoch;
+                                    RecallBubbleUi.schedule();
+                                }
+                            } catch (Throwable ignored) {}
                             // 退群/被移除提醒: 取队列 -> 主线程弹 Toast (ctx = 飞书 Application)
                             if (Config.leavenotify && ctx != null) {
                                 try {
@@ -643,37 +692,8 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     }
 
     // ── 防已读 ──────────────────────────────────────────────────────────
-    // 飞书所有 Java→rust 调用走 com.bytedance.lark.sdk.Sdk 的 _invoke* (int command, byte[]).
-    // command = com.bytedance.lark.pb.basic.v1.Command 枚举值.
-    // 已读上报命令: UPDATE_MESSAGES_ME_READ=1021 (对方看到"已读"的元凶).
-    static final int CMD_UPDATE_MESSAGES_ME_READ = 1021;
-    // 观察名单 (开聊天可能触发的读相关命令)
-    static final int[] READ_WATCH = {18 /*ENTER_CHAT*/, 1021 /*UPDATE_MESSAGES_ME_READ*/,
-            1067 /*CREATE_CHAT_LAST_READ_POSITION*/, 2224 /*UPDATE_THREADS_ME_READ*/,
-            2234 /*UPDATE_DOC_ME_READ*/, 2263 /*UPDATE_CHAT_APPLICATION_ME_READ*/};
-    // true=丢弃已读上报(防已读生效); false=仅记录(确认阶段)
-    static final boolean ANTIREAD_DROP = false;
-
-    static volatile boolean ANTIREAD_INSTALLED = false;
-    static final java.util.concurrent.atomic.AtomicInteger INVOKE_LOG_COUNT = new java.util.concurrent.atomic.AtomicInteger(0);
-
-    static final String SDK_CLASS = "com.bytedance.lark.sdk.Sdk";
-
     static void alog(String m) {            // 优先专属 tag antiread-j (非主进程 native 未加载时 fallback)
         try { nativeLog(m); } catch (Throwable t) { XposedBridge.log("[antiread] " + m); }
-    }
-
-    static void installAntiRead(ClassLoader cl) {
-        if (ANTIREAD_INSTALLED) return;
-        Class<?> sdk = XposedHelpers.findClass(SDK_CLASS, cl);
-        InvokeHook h = new InvokeHook();
-        // 钩所有 invoke* 重载 (含带 Command 对象的高层方法). native _invoke 的 int 恒为 10000(噪音).
-        String[] names = {"invoke", "invokeV2", "invokeOpt", "invokeAsync", "invokeAsyncV2", "invokeAsyncOpt"};
-        for (String m : names) {
-            try { XposedBridge.hookAllMethods(sdk, m, h); } catch (Throwable t) { alog(m + " hookAll miss: " + t); }
-        }
-        ANTIREAD_INSTALLED = true;
-        alog("installed hookAll on Sdk.invoke* (drop=" + ANTIREAD_DROP + ")");
     }
 
     // ── 防对方已读 v2 (Java 层, 清 message_ids) ────────────────────────────
@@ -864,7 +884,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
         if (!chatKnown(ch)) return;
         if (!KN_READY || knMethod == null || Boolean.TRUE.equals(KN_REPLAY.get())) return;
         try {
-            if (!Config.antiread || TAMPER == 2) return;
+            if (!Config.antiread) return;
             // 原子认领: 统一会话状态整条 remove —— 并发回复不会双取旧缓存, 也不会误删新缓存。
             KnState st = KN_STATE.remove(ch);
             if (st != null && !st.pendingIds.isEmpty()) {
@@ -883,7 +903,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
     static void triggerReply(String ch) {
         if (!chatKnown(ch)) return;
         long now = System.currentTimeMillis();
-        if (Config.antiread && TAMPER != 2) {
+        if (Config.antiread) {
             READ_WINDOWS.put(ch, Long.valueOf(now + READ_WINDOW_MS));
             for (java.util.Map.Entry<String, Long> e : READ_WINDOWS.entrySet()) {
                 if (e.getValue().longValue() < now - READ_WINDOW_MS) READ_WINDOWS.remove(e.getKey());
@@ -1106,7 +1126,7 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
                         && System.currentTimeMillis() < windowEnd.longValue();
                 int midsBefore = (a[0] instanceof java.util.List) ? ((java.util.List) a[0]).size() : -1;
 
-                if (Config.antiread && TAMPER != 2) {
+                if (Config.antiread) {
                     if (inSendWindow) {
                         // 回复窗口内: 放行, 并把该会话浏览时暂存的 message_ids 补回去(安卓回复只带
                         //   max_position 不带 ids, 不补则对方仍未读) -> 对方看到你已读可视消息。
@@ -1169,52 +1189,6 @@ public class AntiRecall implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 }
             } catch (Throwable ignore) {
             }
-        }
-    }
-
-    static boolean isWatched(int cmd) {
-        for (int c : READ_WATCH) if (c == cmd) return true;
-        return false;
-    }
-
-    static class InvokeHook extends XC_MethodHook {
-        @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
-            try {
-                if (param.args == null || param.args.length == 0) return;
-                Object a0 = param.args[0];
-                int cmd;
-                if (a0 instanceof Integer) {
-                    cmd = (Integer) a0;
-                } else if (a0 != null) {
-                    // Command 对象 -> getValue()
-                    try { cmd = (Integer) XposedHelpers.callMethod(a0, "getValue"); }
-                    catch (Throwable t) { return; }   // 不是 Command, 跳过
-                } else return;
-                if (cmd == 10000) return;             // native 包装哨兵噪音, 忽略
-                // 诊断: 记录命令(限量), 找开聊天触发的读命令
-                int c = INVOKE_LOG_COUNT.incrementAndGet();
-                if (c <= 4000) {
-                    alog("invoke cmd=" + cmd
-                            + (isWatched(cmd) ? " *READ*" : "")
-                            + (cmd == CMD_UPDATE_MESSAGES_ME_READ ? " <UPDATE_MESSAGES_ME_READ>" : ""));
-                }
-                if (ANTIREAD_DROP && cmd == CMD_UPDATE_MESSAGES_ME_READ) {
-                    param.setResult(null);
-                    alog("DROPPED UPDATE_MESSAGES_ME_READ");
-                }
-            } catch (Throwable ignore) {
-            }
-        }
-    }
-
-    static String textOf(Object content) {
-        if (content == null) return null;
-        try {
-            Object s = XposedHelpers.callMethod(content, "getText");
-            return s == null ? null : s.toString();
-        } catch (Throwable t) {
-            return null;
         }
     }
 

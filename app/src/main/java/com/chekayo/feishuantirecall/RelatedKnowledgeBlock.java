@@ -12,7 +12,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.WeakHashMap;
-import java.util.WeakHashMap;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -46,19 +45,12 @@ public final class RelatedKnowledgeBlock {
     public static synchronized void install() {
         if (installed) return;
         installed = true;
-        XC_MethodHook addHook = new XC_MethodHook() {
-            @Override protected void afterHookedMethod(MethodHookParam p) {
-                try {
-                    View parent = (View) p.thisObject;
-                    View child = (View) p.args[0];
-                    if (isAiNode(child) || isReplyLayout(parent)) schedule(parent);
-                } catch (Throwable ignored) {}
+        ViewHookHub.addAddViewListener(new ViewHookHub.AddViewListener() {
+            @Override public boolean beforeAddView(ViewGroup parent, View child) { return false; }
+            @Override public void afterAddView(ViewGroup parent, View child) {
+                if (isAiNode(child) || isReplyLayout(parent)) schedule(parent);
             }
-        };
-        hook(ViewGroup.class, "addView", View.class, addHook);
-        hook(ViewGroup.class, "addView", View.class, int.class, addHook);
-        hook(ViewGroup.class, "addView", View.class, ViewGroup.LayoutParams.class, addHook);
-        hook(ViewGroup.class, "addView", View.class, int.class, ViewGroup.LayoutParams.class, addHook);
+        });
         hook(View.class, "setId", int.class, new XC_MethodHook() {
             @Override protected void afterHookedMethod(MethodHookParam p) {
                 try {
@@ -82,27 +74,26 @@ public final class RelatedKnowledgeBlock {
                 catch (Throwable ignored) {}
             }
         });
-        hook(View.class, "setVisibility", int.class, new XC_MethodHook() {
-            @Override protected void beforeHookedMethod(MethodHookParam p) {
-                try {
-                    if (!onMainThread() || changingVisibility) return;
-                    View v = (View) p.thisObject;
-                    if (shouldBlock(v)) {
-                        CANDIDATES.put(v, Boolean.TRUE);
-                        if (Config.blockrelatedknowledge) {
-                            if ((Integer) p.args[0] == View.VISIBLE) record(v, "宿主请求显示");
-                            State state = HIDDEN.get(v);
-                            if (state == null) HIDDEN.put(v, new State((Integer) p.args[0]));
-                            else state.visibility = (Integer) p.args[0];
-                            p.args[0] = View.GONE;
-                        } else HIDDEN.remove(v);
-                        schedule(v);
-                    } else if (HIDDEN.containsKey(v)) {
-                        HIDDEN.remove(v); // 宿主正在复用节点，遵从它本次请求的显示状态。
-                    }
-                    Object parent = v.getParent();
-                    if (parent instanceof View && isReplyLayout((View) parent)) schedule((View) parent);
-                } catch (Throwable ignored) {}
+        ViewHookHub.addSetVisibilityListener(new ViewHookHub.SetVisibilityListener() {
+            @Override public int beforeSetVisibility(View v, int visibility) {
+                if (!onMainThread() || changingVisibility) return visibility;
+                int out = visibility;
+                if (shouldBlock(v)) {
+                    CANDIDATES.put(v, Boolean.TRUE);
+                    if (Config.blockrelatedknowledge) {
+                        if (visibility == View.VISIBLE) record(v, "宿主请求显示");
+                        State state = HIDDEN.get(v);
+                        if (state == null) HIDDEN.put(v, new State(visibility));
+                        else state.visibility = visibility;
+                        out = View.GONE;
+                    } else HIDDEN.remove(v);
+                    schedule(v);
+                } else if (HIDDEN.containsKey(v)) {
+                    HIDDEN.remove(v); // 宿主正在复用节点，遵从它本次请求的显示状态。
+                }
+                Object parent = v.getParent();
+                if (parent instanceof View && isReplyLayout((View) parent)) schedule((View) parent);
+                return out;
             }
         });
         XposedBridge.log("[fucklark] 相关知识屏蔽: ai_smart_reply 资源 hooks 已安装");
@@ -137,19 +128,24 @@ public final class RelatedKnowledgeBlock {
     }
 
     private static String resourceName(View v) {
-        android.content.res.Resources resources = v.getResources();
+        if (v == null) return "";
         int id = v.getId();
+        if (id == View.NO_ID || (id >>> 24) != 0x7f) return "";
+        android.content.res.Resources resources = v.getResources();
+        if (resources == null) return "";
         synchronized (RESOURCE_NAMES) {
             Map<Integer, String> names = RESOURCE_NAMES.get(resources);
             if (names == null) {
                 names = new HashMap<Integer, String>();
                 RESOURCE_NAMES.put(resources, names);
             }
-            if (names.containsKey(id)) return names.get(id);
+            String cached = names.get(id);
+            if (cached != null) return cached;
             String name;
             try { name = resources.getResourceEntryName(id); }
             catch (Throwable ignored) { name = ""; }
-            // 空串也缓存，避免每个无 ID / 非应用 ID 的 View 反复抛资源异常。
+            if (name == null) name = "";
+            // 空串也缓存，避免无效 ID 反复抛资源异常。
             names.put(id, name);
             return name;
         }
@@ -211,7 +207,6 @@ public final class RelatedKnowledgeBlock {
 
     private static void record(View v, String via) {
         // 标题、外壳共用一条事件，避免一次渲染产生多条日志。
-        View target = v;
         View identity = v;
         for (int i = 0; i < 3 && v.getParent() instanceof View; i++) {
             v = (View) v.getParent();

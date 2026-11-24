@@ -3,6 +3,12 @@ package com.chekayo.feishuantirecall;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 import org.json.JSONObject;
 import android.content.Context;
@@ -22,7 +28,7 @@ import android.os.Bundle;
  * 2. 接收端只 apply，绝不回推（回推曾导致广播风暴）；
  * 3. apply 保留对端 updatedAt，不抬到 now（否则双方永远"我更新"）；
  * 4. 不向本包名广播；
- * 5. 飞书经 ContentProvider 合并单项改动，并每两秒拉取模块权威配置；
+ * 5. 飞书经 ContentProvider 合并单项改动，并定期拉取模块权威配置；
  * 6. 连续广播合并发送最新快照，不丢弃最后一次改动。
  */
 public class Config {
@@ -35,7 +41,6 @@ public class Config {
     public static volatile boolean diaglog = false;     // 诊断日志 (关=完全不写文件)
     public static volatile boolean keepkicked = false;  // 保留被踢群聊天记录
     public static volatile boolean leavenotify = false; // 退群/被移除提醒 (Toast + 记录)
-    public static volatile boolean orgwalker = true;   // 组织架构自动巡游 (AccessibilityService, 需在系统无障碍里开启)
     public static volatile boolean notifarchive = false; // 后台消息存档 (hook 通知抓正文, 救后台被撤回的消息)
     public static volatile boolean dewatermark = false; // 去除聊天水印 (hook View.setForeground 丢弃 watermark 前景)
     public static volatile boolean downloadunlock = false; // 解除文件/图片下载限制 (加密聊天禁另存 -> 强制放行)
@@ -59,17 +64,40 @@ public class Config {
     public static volatile boolean showRecallHint = true;      // 是否显示保留原消息的撤回提示或颜色标识
     public static final String DEFAULT_RECALL_BORDER_COLOR = "#E5484D";
     public static volatile String recallBorderColor = DEFAULT_RECALL_BORDER_COLOR;
-    public static volatile boolean recallHintOriginal = true;  // 撤回提示是否附带原文
     public static volatile String recallHintText = "撤回了一条消息"; // 可自定义提示文案（可用 {name} 代表发送人）
 
     // 由 AntiRecall.startNative / LauncherActivity / SettingsPanel 调 setFilesDir 初始化(按当前目标包, 国内/国际版自适应)。
     static volatile File cfgFile;
-    private static final android.os.Handler MAIN = new android.os.Handler(android.os.Looper.getMainLooper());
+    private static final android.os.Handler MAIN = createMainHandler();
     private static boolean broadcastPending;
     private static boolean polling;
-    private static final JSONObject pendingEdits = new JSONObject();
+    private static JSONObject pendingEdits;
     private static volatile String syncError = "";
     static final String MODULE_PKG = "com.chekayo.feishuantirecall";
+    private static final Pattern PKG_PATTERN = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+");
+    private static final int MAX_KNOWN_HOSTS = 32;
+    private static final Set<String> KNOWN_HOSTS = new LinkedHashSet<String>();
+    private static File knownHostsLoadedFrom;
+
+    private static final String[] KNOWN_KEYS = {
+            "schema", "antirecall", "resign", "antiread", "diaglog", "keepkicked",
+            "leavenotify", "notifarchive", "dewatermark", "downloadunlock", "restrictunlock",
+            "pubdownload", "screenshotnoaudit", "forcescreenshot", "noauditall",
+            "pubdownloadSubdir", "updatebanner", "dismissedUpc", "showRecallHint",
+            "recallDisplayMode", "recallBorderColor", "recallHintText",
+            "blockaipeek", "blockrelatedknowledge", "messageTimeAlways",
+            "messageTimeFormatting", "messageTimePattern"
+    };
+
+    private static android.os.Handler createMainHandler() {
+        try { return new android.os.Handler(android.os.Looper.getMainLooper()); }
+        catch (Throwable ignored) { return null; }
+    }
+
+    private static JSONObject pendingEditsObj() {
+        if (pendingEdits == null) pendingEdits = new JSONObject();
+        return pendingEdits;
+    }
 
     /** 保存应用级 Context，用于向飞书进程发送配置同步广播。 */
     public static void setContext(Context c) { if (c != null) appContext = c.getApplicationContext(); }
@@ -89,6 +117,77 @@ public class Config {
         return null;
     }
 
+    /** 返回已知飞书宿主包名列表：始终包含国内版、国际版及已注册的白标宿主。 */
+    static synchronized List<String> knownHostPackages() {
+        loadKnownHostsLocked();
+        LinkedHashSet<String> hosts = new LinkedHashSet<String>();
+        hosts.add("com.ss.android.lark");
+        hosts.add("com.larksuite.suite");
+        hosts.addAll(KNOWN_HOSTS);
+        Context c = appContext;
+        if (c != null) {
+            String self = c.getPackageName();
+            if (isValidHostPackage(self)) hosts.add(self);
+        }
+        return new ArrayList<String>(hosts);
+    }
+
+    /** 校验并持久化新发现的白标飞书宿主包名到模块 filesDir/known_hosts.txt。 */
+    static synchronized void registerHostPackage(String pkg) {
+        if (!isValidHostPackage(pkg)) return;
+        if ("com.ss.android.lark".equals(pkg) || "com.larksuite.suite".equals(pkg)) return;
+        loadKnownHostsLocked();
+        if (KNOWN_HOSTS.contains(pkg) || KNOWN_HOSTS.size() >= MAX_KNOWN_HOSTS) return;
+        KNOWN_HOSTS.add(pkg);
+        File f = knownHostsFile();
+        if (f == null) return;
+        try {
+            File dir = f.getParentFile();
+            if (dir != null && !dir.isDirectory()) dir.mkdirs();
+            StringBuilder sb = new StringBuilder();
+            for (String host : KNOWN_HOSTS) sb.append(host).append('\n');
+            write(f, sb.toString());
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean isValidHostPackage(String pkg) {
+        return pkg != null && pkg.length() <= 128 && !MODULE_PKG.equals(pkg)
+                && PKG_PATTERN.matcher(pkg).matches();
+    }
+
+    private static File knownHostsFile() {
+        Context c = appContext;
+        if (c != null && MODULE_PKG.equals(c.getPackageName())) {
+            return new File(c.getFilesDir(), "known_hosts.txt");
+        }
+        if (c == null && cfgFile != null && cfgFile.getParentFile() != null) {
+            return new File(cfgFile.getParentFile(), "known_hosts.txt");
+        }
+        try {
+            return new File(ProfilePaths.filesDir(MODULE_PKG), "known_hosts.txt");
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static void loadKnownHostsLocked() {
+        File f = knownHostsFile();
+        if (f == null) return;
+        if (f.equals(knownHostsLoadedFrom)) return;
+        knownHostsLoadedFrom = f;
+        if (!f.isFile()) return;
+        try {
+            String content = read(f);
+            for (String line : content.split("\\r?\\n")) {
+                String pkg = line.trim();
+                if (isValidHostPackage(pkg) && !"com.ss.android.lark".equals(pkg)
+                        && !"com.larksuite.suite".equals(pkg) && KNOWN_HOSTS.size() < MAX_KNOWN_HOSTS) {
+                    KNOWN_HOSTS.add(pkg);
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
     /** 读文件全部字节；失败返回 null。 */
     static byte[] readBytes(File f) {
         try {
@@ -97,6 +196,11 @@ public class Config {
                 byte[] b = new byte[(int) f.length()];
                 int off = 0, r;
                 while (off < b.length && (r = is.read(b, off, b.length - off)) > 0) off += r;
+                if (off < b.length) {
+                    byte[] exact = new byte[off];
+                    System.arraycopy(b, 0, exact, 0, off);
+                    return exact;
+                }
                 return b;
             } finally { is.close(); }
         } catch (Throwable t) { return null; }
@@ -108,16 +212,15 @@ public class Config {
             JSONObject o = new JSONObject();
             o.put("schema", 1);
             o.put("updatedAt", updatedAt);
-            o.put("antirecall",antirecall); o.put("resign",resign); o.put("antiread",antiread);
-            o.put("diaglog",diaglog); o.put("keepkicked",keepkicked); o.put("leavenotify",leavenotify);
-            o.put("orgwalker",orgwalker); o.put("notifarchive",notifarchive); o.put("dewatermark",dewatermark);
-            o.put("downloadunlock",downloadunlock); o.put("restrictunlock",restrictunlock); o.put("pubdownload",pubdownload);
-            o.put("screenshotnoaudit",screenshotnoaudit); o.put("forcescreenshot",forcescreenshot); o.put("noauditall",noauditall);
-            o.put("pubdownloadSubdir",pubdownloadSubdir); o.put("updatebanner",updatebanner); o.put("dismissedUpc",dismissedUpc);
+            o.put("antirecall", antirecall); o.put("resign", resign); o.put("antiread", antiread);
+            o.put("diaglog", diaglog); o.put("keepkicked", keepkicked); o.put("leavenotify", leavenotify);
+            o.put("notifarchive", notifarchive); o.put("dewatermark", dewatermark);
+            o.put("downloadunlock", downloadunlock); o.put("restrictunlock", restrictunlock); o.put("pubdownload", pubdownload);
+            o.put("screenshotnoaudit", screenshotnoaudit); o.put("forcescreenshot", forcescreenshot); o.put("noauditall", noauditall);
+            o.put("pubdownloadSubdir", pubdownloadSubdir); o.put("updatebanner", updatebanner); o.put("dismissedUpc", dismissedUpc);
             o.put("showRecallHint", showRecallHint);
             o.put("recallDisplayMode", recallDisplayMode);
             o.put("recallBorderColor", recallBorderColor);
-            o.put("recallHintOriginal", recallHintOriginal);
             o.put("recallHintText", recallHintText);
             o.put("blockaipeek", blockaipeek);
             o.put("blockrelatedknowledge", blockrelatedknowledge);
@@ -126,6 +229,42 @@ public class Config {
             o.put("messageTimePattern", messageTimePattern);
             return o.toString();
         } catch (Throwable t) { return "{}"; }
+    }
+
+    private static boolean hasKnownConfigKey(JSONObject o) {
+        for (String key : KNOWN_KEYS) {
+            if (o.has(key)) return true;
+        }
+        return false;
+    }
+
+    private static void applyFields(JSONObject o) {
+        antirecall = o.optBoolean("antirecall", true);
+        resign = o.optBoolean("resign", true);
+        antiread = o.optBoolean("antiread", false);
+        diaglog = o.optBoolean("diaglog", false);
+        keepkicked = o.optBoolean("keepkicked", false);
+        leavenotify = o.optBoolean("leavenotify", false);
+        notifarchive = o.optBoolean("notifarchive", false);
+        dewatermark = o.optBoolean("dewatermark", false);
+        downloadunlock = o.optBoolean("downloadunlock", false);
+        restrictunlock = o.optBoolean("restrictunlock", false);
+        pubdownload = o.optBoolean("pubdownload", false);
+        screenshotnoaudit = o.optBoolean("screenshotnoaudit", false);
+        forcescreenshot = o.optBoolean("forcescreenshot", false);
+        noauditall = o.optBoolean("noauditall", false);
+        pubdownloadSubdir = sanitizeSubdir(o.optString("pubdownloadSubdir", "Lark"));
+        updatebanner = o.optBoolean("updatebanner", true);
+        dismissedUpc = o.optInt("dismissedUpc", 0);
+        showRecallHint = o.optBoolean("showRecallHint", true);
+        recallDisplayMode = sanitizeRecallDisplayMode(o.optInt("recallDisplayMode", RECALL_MODE_COLOR));
+        recallBorderColor = sanitizeRecallBorderColor(o.optString("recallBorderColor", DEFAULT_RECALL_BORDER_COLOR));
+        recallHintText = sanitizeRecallHint(o.optString("recallHintText", "撤回了一条消息"));
+        blockaipeek = o.optBoolean("blockaipeek", true);
+        blockrelatedknowledge = o.optBoolean("blockrelatedknowledge", true);
+        messageTimeAlways = o.optBoolean("messageTimeAlways", false);
+        messageTimeFormatting = o.optBoolean("messageTimeFormatting", false);
+        messageTimePattern = sanitizeTimePattern(o.optString("messageTimePattern", MessageTimeFormat.DEFAULT));
     }
 
     /**
@@ -141,26 +280,93 @@ public class Config {
             // 本地更新 → 不覆盖（接收端禁止回推，否则广播风暴）
             if (incoming > 0 && incoming < updatedAt) return false;
             if (incoming > 0) updatedAt = incoming;
-            antirecall=o.optBoolean("antirecall",true); resign=o.optBoolean("resign",true); antiread=o.optBoolean("antiread",false);
-            diaglog=o.optBoolean("diaglog",false); keepkicked=o.optBoolean("keepkicked",false); leavenotify=o.optBoolean("leavenotify",false);
-            orgwalker=o.optBoolean("orgwalker",true); notifarchive=o.optBoolean("notifarchive",false); dewatermark=o.optBoolean("dewatermark",false);
-            downloadunlock=o.optBoolean("downloadunlock",false); restrictunlock=o.optBoolean("restrictunlock",false); pubdownload=o.optBoolean("pubdownload",false);
-            screenshotnoaudit=o.optBoolean("screenshotnoaudit",false); forcescreenshot=o.optBoolean("forcescreenshot",false); noauditall=o.optBoolean("noauditall",false);
-            pubdownloadSubdir=o.optString("pubdownloadSubdir","Lark"); updatebanner=o.optBoolean("updatebanner",true); dismissedUpc=o.optInt("dismissedUpc",0);
-            showRecallHint = o.optBoolean("showRecallHint", true);
-            recallDisplayMode = sanitizeRecallDisplayMode(o.optInt("recallDisplayMode", RECALL_MODE_COLOR));
-            recallBorderColor = sanitizeRecallBorderColor(o.optString("recallBorderColor", DEFAULT_RECALL_BORDER_COLOR));
-            recallHintOriginal = o.optBoolean("recallHintOriginal", true);
-            recallHintText = o.optString("recallHintText", "撤回了一条消息");
-            blockaipeek = o.optBoolean("blockaipeek", true);
-            blockrelatedknowledge = o.optBoolean("blockrelatedknowledge", true);
-            messageTimeAlways = o.optBoolean("messageTimeAlways", false);
-            messageTimeFormatting = o.optBoolean("messageTimeFormatting", false);
-            messageTimePattern = sanitizeTimePattern(o.optString("messageTimePattern", MessageTimeFormat.DEFAULT));
+            applyFields(o);
             save();
             notifyHooks();
             return true;
         } catch (Throwable t) { return false; }
+    }
+
+    /**
+     * 导入剪贴板或用户显式导入的 JSON 快照：抬高 updatedAt，保存并跨进程推送，避免被轮询覆盖。
+     * @return true=导入成功；false=输入为空、非法 JSON 或不含有效配置项。
+     */
+    public static synchronized boolean applyImportedSnapshot(String json) {
+        try {
+            if (json == null || json.trim().isEmpty()) return false;
+            JSONObject o = new JSONObject(json.trim());
+            if (o.length() == 0 || !hasKnownConfigKey(o)) return false;
+            long incoming = o.optLong("updatedAt", 0);
+            updatedAt = Math.max(System.currentTimeMillis(), Math.max(updatedAt, incoming) + 1);
+            applyFields(o);
+            clearPendingEdits();
+            save();
+            notifyHooks();
+            pushRestoredConfig(appContext);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 备份恢复后抬高修订并同步到模块/宿主进程，防止轮询用旧配置覆盖恢复结果。 */
+    static synchronized void syncAfterRestore(Context c) {
+        if (c != null) setContext(c);
+        updatedAt = Math.max(System.currentTimeMillis(), updatedAt + 1);
+        clearPendingEdits();
+        save();
+        notifyHooks();
+        pushRestoredConfig(c != null ? c : appContext);
+    }
+
+    /** Provider 侧接收宿主强制恢复推送（忽略旧时间戳并抬高权威修订）。 */
+    static synchronized boolean applyAuthorityRestore(String json) {
+        try {
+            if (json == null || json.trim().isEmpty()) return false;
+            JSONObject o = new JSONObject(json.trim());
+            if (o.length() == 0 || !hasKnownConfigKey(o)) return false;
+            long incoming = o.optLong("updatedAt", 0);
+            updatedAt = Math.max(System.currentTimeMillis(), Math.max(updatedAt, incoming) + 1);
+            applyFields(o);
+            save();
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static void pushRestoredConfig(Context c) {
+        if (c == null || MODULE_PKG.equals(c.getPackageName())) {
+            broadcast();
+            return;
+        }
+        String snap = snapshot();
+        try {
+            Bundle extras = new Bundle();
+            extras.putString("json", snap);
+            extras.putBoolean("force", true);
+            Bundle res = c.getContentResolver().call(ConfigProvider.URI, "put", null, extras);
+            if (res != null && res.getString("json") != null) {
+                acceptAuthority(res.getString("json"));
+                clearPendingEdits();
+                return;
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("fucklark", "恢复配置推送 Provider 失败，回落待同步队列与广播", t);
+        }
+        // Provider 暂不可达时：把恢复后的全部字段放入待同步补丁，待重连时优先合并，不被旧权威覆盖。
+        try {
+            JSONObject o = new JSONObject(snap);
+            JSONObject pending = pendingEditsObj();
+            Iterator<String> keys = o.keys();
+            while (keys.hasNext()) {
+                String k = keys.next();
+                if ("schema".equals(k) || "updatedAt".equals(k)) continue;
+                pending.put(k, o.get(k));
+            }
+            persistPendingEdits();
+        } catch (Throwable ignored) {}
+        broadcast();
     }
 
     /** 本地 updatedAt（供同步协议判断谁更新）。 */
@@ -184,34 +390,7 @@ public class Config {
                     long m = cfgFile.lastModified();
                     if (m > 0) updatedAt = m;
                 }
-                antirecall = o.optBoolean("antirecall", true);
-                resign = o.optBoolean("resign", true);
-                antiread = o.optBoolean("antiread", false);
-                diaglog = o.optBoolean("diaglog", false);
-                keepkicked = o.optBoolean("keepkicked", false);
-                leavenotify = o.optBoolean("leavenotify", false);
-                orgwalker = o.optBoolean("orgwalker", true);
-                notifarchive = o.optBoolean("notifarchive", false);
-                dewatermark = o.optBoolean("dewatermark", false);
-                downloadunlock = o.optBoolean("downloadunlock", false);
-                restrictunlock = o.optBoolean("restrictunlock", false);
-                pubdownload = o.optBoolean("pubdownload", false);
-                screenshotnoaudit = o.optBoolean("screenshotnoaudit", false);
-                forcescreenshot = o.optBoolean("forcescreenshot", false);
-                noauditall = o.optBoolean("noauditall", false);
-                pubdownloadSubdir = o.optString("pubdownloadSubdir", "Lark");
-                updatebanner = o.optBoolean("updatebanner", true);
-                dismissedUpc = o.optInt("dismissedUpc", 0);
-                showRecallHint = o.optBoolean("showRecallHint", true);
-                recallDisplayMode = sanitizeRecallDisplayMode(o.optInt("recallDisplayMode", RECALL_MODE_COLOR));
-                recallBorderColor = sanitizeRecallBorderColor(o.optString("recallBorderColor", DEFAULT_RECALL_BORDER_COLOR));
-                recallHintOriginal = o.optBoolean("recallHintOriginal", true);
-                recallHintText = o.optString("recallHintText", "撤回了一条消息");
-                blockaipeek = o.optBoolean("blockaipeek", true);
-                blockrelatedknowledge = o.optBoolean("blockrelatedknowledge", true);
-            messageTimeAlways = o.optBoolean("messageTimeAlways", false);
-            messageTimeFormatting = o.optBoolean("messageTimeFormatting", false);
-            messageTimePattern = sanitizeTimePattern(o.optString("messageTimePattern", MessageTimeFormat.DEFAULT));
+                applyFields(o);
                 notifyHooks();
             } else {
                 // 首次无本地文件：不立刻 save（多进程会互相覆盖成默认值）。由 sync 对齐后再落盘。
@@ -229,7 +408,6 @@ public class Config {
         else if ("diaglog".equals(key)) { changed = diaglog != v; diaglog = v; }
         else if ("keepkicked".equals(key)) { changed = keepkicked != v; keepkicked = v; }
         else if ("leavenotify".equals(key)) { changed = leavenotify != v; leavenotify = v; }
-        else if ("orgwalker".equals(key)) { changed = orgwalker != v; orgwalker = v; }
         else if ("notifarchive".equals(key)) { changed = notifarchive != v; notifarchive = v; }
         else if ("dewatermark".equals(key)) { changed = dewatermark != v; dewatermark = v; }
         else if ("downloadunlock".equals(key)) { changed = downloadunlock != v; downloadunlock = v; }
@@ -240,7 +418,6 @@ public class Config {
         else if ("noauditall".equals(key)) { changed = noauditall != v; noauditall = v; }
         else if ("updatebanner".equals(key)) { changed = updatebanner != v; updatebanner = v; }
         else if ("showRecallHint".equals(key)) { changed = showRecallHint != v; showRecallHint = v; }
-        else if ("recallHintOriginal".equals(key)) { changed = recallHintOriginal != v; recallHintOriginal = v; }
         else if ("blockaipeek".equals(key)) { changed = blockaipeek != v; blockaipeek = v; }
         else if ("blockrelatedknowledge".equals(key)) { changed = blockrelatedknowledge != v; blockrelatedknowledge = v; }
         else if ("messageTimeFormatting".equals(key)) { changed = messageTimeFormatting != v; messageTimeFormatting = v; }
@@ -269,7 +446,7 @@ public class Config {
         return mode == RECALL_MODE_HINT ? RECALL_MODE_HINT : RECALL_MODE_COLOR;
     }
 
-    // 字符串配置(目前仅 pubdownloadSubdir / recallHintText)。子目录名做基本清洗。
+    // 字符串配置。子目录名与提示文案做基本清洗。
     public static synchronized void setStr(String key, String v) {
         prepareEdit();
         if ("pubdownloadSubdir".equals(key)) {
@@ -316,7 +493,7 @@ public class Config {
 
     /** 合并连续改动后发送最新快照，最后一次改动一定送出。 */
     public static synchronized void broadcast() {
-        if (broadcastPending) return;
+        if (MAIN == null || broadcastPending) return;
         broadcastPending = true;
         MAIN.postDelayed(new Runnable() {
             @Override public void run() {
@@ -325,8 +502,9 @@ public class Config {
                 if (c == null) return;
                 String json = snapshot();
                 String self = c.getPackageName();
-                if (!"com.ss.android.lark".equals(self)) sendTo(c, "com.ss.android.lark", json);
-                if (!"com.larksuite.suite".equals(self)) sendTo(c, "com.larksuite.suite", json);
+                for (String pkg : knownHostPackages()) {
+                    if (!pkg.equals(self)) sendTo(c, pkg, json);
+                }
                 if (!MODULE_PKG.equals(self)) sendTo(c, MODULE_PKG, json);
             }
         }, 100);
@@ -369,9 +547,10 @@ public class Config {
         if (c == null || MODULE_PKG.equals(c.getPackageName())) return;
         try {
             loadPendingEdits();
-            if (pendingEdits.length() > 0) {
+            JSONObject pending = pendingEditsObj();
+            if (pending.length() > 0) {
                 Bundle patch = new Bundle();
-                patch.putString("json", pendingEdits.toString());
+                patch.putString("json", pending.toString());
                 Bundle applied = c.getContentResolver().call(ConfigProvider.URI, "patch", null, patch);
                 if (applied == null || applied.getString("json") == null) throw new IllegalStateException("配置源无响应");
                 acceptAuthority(applied.getString("json"));
@@ -385,6 +564,10 @@ public class Config {
             info.putString("build", ModuleBuild.BUILD);
             info.putInt("versionCode", ModuleBuild.VERSION_CODE);
             info.putLong("updatedAt", updatedAt);
+            try { info.putString("timeStatus", MessageTimeDisplay.status()); } catch (Throwable ignored) {}
+            try { info.putString("recallStatus", RecallMessages.status()); } catch (Throwable ignored) {}
+            try { info.putString("bubbleStatus", RecallBubbleUi.status()); } catch (Throwable ignored) {}
+            try { info.putBoolean("nativeLoaded", AntiRecall.NATIVE_STARTED); } catch (Throwable ignored) {}
             Bundle b = c.getContentResolver().call(ConfigProvider.URI, "get", null, info);
             if (b == null || b.getString("json") == null) throw new IllegalStateException("配置源无响应");
             String remote = b.getString("json");
@@ -413,10 +596,10 @@ public class Config {
     private static void commitEdit(String key, Object value) {
         Context c = appContext;
         if (c != null && !MODULE_PKG.equals(c.getPackageName())) {
-            try { pendingEdits.put(key, value); persistPendingEdits(); }
+            try { pendingEditsObj().put(key, value); persistPendingEdits(); }
             catch (Throwable t) { android.util.Log.w("fucklark", "待同步配置保存失败: " + t); }
             syncWithProvider();
-            if (pendingEdits.length() == 0) return;
+            if (pendingEditsObj().length() == 0) return;
         }
         updatedAt = Math.max(System.currentTimeMillis(), updatedAt + 1);
         save();
@@ -430,10 +613,10 @@ public class Config {
         load();
         JSONObject current = new JSONObject(snapshot());
         JSONObject patch = new JSONObject(json);
-        java.util.Iterator<String> keys = patch.keys();
+        Iterator<String> keys = patch.keys();
         while (keys.hasNext()) {
             String key = keys.next();
-            if ("updatedAt".equals(key) || !current.has(key)) continue;
+            if ("updatedAt".equals(key) || "schema".equals(key) || !current.has(key)) continue;
             Object old = current.get(key), value = patch.get(key);
             if ((old instanceof Boolean && value instanceof Boolean)
                     || (old instanceof Number && value instanceof Number)
@@ -457,16 +640,19 @@ public class Config {
         File f = pendingFile();
         if (f == null || !f.exists()) return;
         JSONObject saved = new JSONObject(read(f));
-        java.util.Iterator<String> keys = saved.keys();
-        while (keys.hasNext()) { String key = keys.next(); if (!pendingEdits.has(key)) pendingEdits.put(key, saved.get(key)); }
+        JSONObject pending = pendingEditsObj();
+        Iterator<String> keys = saved.keys();
+        while (keys.hasNext()) { String key = keys.next(); if (!pending.has(key)) pending.put(key, saved.get(key)); }
     }
     private static void persistPendingEdits() throws Exception {
         File f = pendingFile();
-        if (f != null) { f.getParentFile().mkdirs(); write(f, pendingEdits.toString()); }
+        if (f != null) { f.getParentFile().mkdirs(); write(f, pendingEditsObj().toString()); }
     }
     private static void clearPendingEdits() {
-        java.util.Iterator<String> keys = pendingEdits.keys();
-        while (keys.hasNext()) { keys.next(); keys.remove(); }
+        if (pendingEdits != null) {
+            Iterator<String> keys = pendingEdits.keys();
+            while (keys.hasNext()) { keys.next(); keys.remove(); }
+        }
         File f = pendingFile();
         if (f != null) f.delete();
     }
@@ -521,7 +707,6 @@ public class Config {
             o.put("diaglog", diaglog);
             o.put("keepkicked", keepkicked);
             o.put("leavenotify", leavenotify);
-            o.put("orgwalker", orgwalker);
             o.put("notifarchive", notifarchive);
             o.put("dewatermark", dewatermark);
             o.put("downloadunlock", downloadunlock);
@@ -536,7 +721,6 @@ public class Config {
             o.put("showRecallHint", showRecallHint);
             o.put("recallDisplayMode", recallDisplayMode);
             o.put("recallBorderColor", recallBorderColor);
-            o.put("recallHintOriginal", recallHintOriginal);
             o.put("recallHintText", recallHintText);
             o.put("blockaipeek", blockaipeek);
             o.put("blockrelatedknowledge", blockrelatedknowledge);
@@ -554,18 +738,33 @@ public class Config {
 
     static String read(File f) throws Exception {
         FileInputStream is = new FileInputStream(f);
-        byte[] b = new byte[(int) f.length()];
-        int off = 0, r; while (off < b.length && (r = is.read(b, off, b.length - off)) > 0) off += r;
-        is.close(); return new String(b, 0, off, "UTF-8");
+        try {
+            byte[] b = new byte[(int) f.length()];
+            int off = 0, r;
+            while (off < b.length && (r = is.read(b, off, b.length - off)) > 0) off += r;
+            return new String(b, 0, off, "UTF-8");
+        } finally { is.close(); }
     }
+
     static void write(File f, String s) throws Exception {
-        File temp = new File(f.getParentFile(), f.getName() + ".tmp."
-                + android.os.Process.myPid() + "." + Thread.currentThread().getId());
+        writeBytes(f, s.getBytes("UTF-8"));
+    }
+
+    static void writeBytes(File f, byte[] data) throws Exception {
+        File parent = f.getParentFile();
+        if (parent != null && !parent.isDirectory()) parent.mkdirs();
+        long pid = 0;
+        try { pid = android.os.Process.myPid(); } catch (Throwable ignored) {}
+        File temp = new File(parent, f.getName() + ".tmp." + pid + "." + Thread.currentThread().getId());
         try {
             FileOutputStream os = new FileOutputStream(temp);
-            try { os.write(s.getBytes("UTF-8")); os.flush(); os.getFD().sync(); }
+            try { os.write(data); os.flush(); os.getFD().sync(); }
             finally { os.close(); }
-            if (!temp.renameTo(f)) throw new java.io.IOException("无法替换配置文件 " + f);
+            if (!temp.renameTo(f)) {
+                if (!(f.exists() && f.delete() && temp.renameTo(f))) {
+                    throw new java.io.IOException("无法替换配置文件 " + f);
+                }
+            }
             f.setReadable(true, false);
         } finally { if (temp.exists()) temp.delete(); }
     }
