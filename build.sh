@@ -8,12 +8,16 @@
 #   JAVA_HOME                        JDK 根目录
 #   ANDROID_JAR                      android.jar 路径
 #   KEYSTORE                         签名 keystore 路径
+#   KEYSTORE_PASS                    keystore 密码（默认 android）
+#   KEY_ALIAS                        签名密钥别名（默认 androiddebugkey）
+#   KEY_PASS                         签名密钥密码（默认与 KEYSTORE_PASS 相同，即 android）
 set -euo pipefail
 
 PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$PROJ/build"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+file_size() { wc -c < "$1" | tr -d ' '; }
 
 # ── 1. JDK（需要 11+，d8/apksigner 要求） ──────────────────────────
 JDKHOME="${JAVA_HOME:-}"
@@ -69,16 +73,19 @@ echo "clang++ = $CLANGPP"
 
 # ── 6. Keystore ───────────────────────────────────────────────────
 KS="${KEYSTORE:-}"
+KS_PASS="${KEYSTORE_PASS:-android}"
+KS_ALIAS="${KEY_ALIAS:-androiddebugkey}"
+K_PASS="${KEY_PASS:-$KS_PASS}"
 if [[ -z "$KS" || ! -f "$KS" ]]; then
   KS="$PROJ/debug.keystore"
   if [[ ! -f "$KS" ]]; then
     echo "Generating debug keystore at $KS ..."
-    "$KEYTOOL" -genkeypair -v -keystore "$KS" -storepass android \
-      -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+    "$KEYTOOL" -genkeypair -v -keystore "$KS" -storepass "$KS_PASS" \
+      -alias "$KS_ALIAS" -keypass "$K_PASS" -keyalg RSA -keysize 2048 \
       -validity 10000 -dname 'CN=Debug,O=Debug,C=US' >/dev/null 2>&1 || die "keytool failed"
   fi
 fi
-echo "Keystore = $KS"
+echo "Keystore = $KS (alias=$KS_ALIAS)"
 
 # ── 构建开始 ──────────────────────────────────────────────────────
 rm -rf "$BUILD"
@@ -90,17 +97,9 @@ NJNI="$PROJ/native/jni"
   -fno-rtti -fno-exceptions -mno-outline-atomics -static-libstdc++ \
   -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -Wl,--no-undefined \
   -Wl,--pack-dyn-relocs=none -Wl,--hash-style=both \
-  -o "$BUILD/libantirecall.so" "$NJNI/antirecall.cpp" "$NJNI/And64InlineHook.cpp" \
+  -o "$BUILD/libantirecall.so" "$NJNI/antirecall.cpp" "$NJNI/resign.cpp" "$NJNI/And64InlineHook.cpp" \
   -llog -ldl -lm
-echo "libantirecall.so = $(awk "BEGIN{printf \"%.1f\", $(stat -c%s "$BUILD/libantirecall.so")/1024}")KB"
-# 额外编 libresign.so (离职统计)
-"$CLANGPP" --target=aarch64-linux-android24 -fPIC -shared -O2 -fvisibility=hidden \
-  -fno-rtti -fno-exceptions -mno-outline-atomics -static-libstdc++ \
-  -Wl,-z,now -Wl,-z,relro -Wl,-z,noexecstack -Wl,--no-undefined \
-  -Wl,--pack-dyn-relocs=none -Wl,--hash-style=both \
-  -o "$BUILD/libresign.so" "$NJNI/resign.cpp" "$NJNI/And64InlineHook.cpp" \
-  -llog -ldl -lm
-echo "libresign.so = $(awk "BEGIN{printf \"%.1f\", $(stat -c%s "$BUILD/libresign.so")/1024}")KB"
+echo "libantirecall.so = $(awk "BEGIN{printf \"%.1f\", $(file_size "$BUILD/libantirecall.so")/1024}")KB"
 
 echo; echo "== 1. javac stubs =="
 find "$PROJ/stubs" -name '*.java' > "$BUILD/stub.list"
@@ -112,31 +111,30 @@ find "$PROJ/app/src/main/java" -name '*.java' > "$BUILD/src.list"
 
 echo; echo "== 3. d8 -> classes.dex (no desugar) =="
 find "$BUILD/app" -name '*.class' > "$BUILD/cls.list"
-"$D8" --min-api 22 --no-desugaring --output "$BUILD" @"$BUILD/cls.list"
+"$D8" --min-api 24 --no-desugaring --output "$BUILD" @"$BUILD/cls.list"
 
 echo; echo "== 4. aapt2 compile + link =="
 "$AAPT2" compile --dir "$PROJ/app/src/main/res" -o "$BUILD/res.zip"
 "$AAPT2" link -o "$BUILD/app-unsigned.apk" -I "$ANDROID_JAR" \
   --manifest "$PROJ/app/src/main/AndroidManifest.xml" \
   -A "$PROJ/app/src/main/assets" \
-  --min-sdk-version 22 --target-sdk-version 34 \
+  --min-sdk-version 24 --target-sdk-version 34 \
   "$BUILD/res.zip"
 
 echo; echo "== 5. 塞入 classes.dex + lib/arm64-v8a/libantirecall.so =="
 mkdir -p "$BUILD/stage/lib/arm64-v8a"
 cp "$BUILD/classes.dex" "$BUILD/stage/classes.dex"
 cp "$BUILD/libantirecall.so" "$BUILD/stage/lib/arm64-v8a/libantirecall.so"
-cp "$BUILD/libresign.so" "$BUILD/stage/lib/arm64-v8a/libresign.so"
-( cd "$BUILD/stage" && zip -q -X "$BUILD/app-unsigned.apk" classes.dex lib/arm64-v8a/libantirecall.so lib/arm64-v8a/libresign.so )
+( cd "$BUILD/stage" && zip -q -X "$BUILD/app-unsigned.apk" classes.dex lib/arm64-v8a/libantirecall.so )
 
 echo; echo "== 6. zipalign =="
 "$ZIPALIGN" -p -f 4 "$BUILD/app-unsigned.apk" "$BUILD/app-aligned.apk"
 
 echo; echo "== 7. apksigner sign =="
-"$APKSIGNER" sign --ks "$KS" --ks-pass pass:android \
-  --ks-key-alias androiddebugkey --key-pass pass:android \
+"$APKSIGNER" sign --ks "$KS" --ks-pass "pass:$KS_PASS" \
+  --ks-key-alias "$KS_ALIAS" --key-pass "pass:$K_PASS" \
   --out "$PROJ/feishu-antirecall.apk" "$BUILD/app-aligned.apk"
 
 echo; echo "== DONE =="
 "$APKSIGNER" verify --print-certs "$PROJ/feishu-antirecall.apk" 2>&1 | head -3
-echo "APK = $PROJ/feishu-antirecall.apk  size=$(awk "BEGIN{printf \"%.1f\", $(stat -c%s "$PROJ/feishu-antirecall.apk")/1024}")KB"
+echo "APK = $PROJ/feishu-antirecall.apk  size=$(awk "BEGIN{printf \"%.1f\", $(file_size "$PROJ/feishu-antirecall.apk")/1024}")KB"

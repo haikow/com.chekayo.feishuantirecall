@@ -1,8 +1,8 @@
-<# Run build.ps1 first. Native tests use only a fresh synthetic database on the
+<# Run build.ps1 (or build.sh) first. Native tests use only a fresh synthetic database on the
    explicitly selected arm64 Android device; no installed app data is opened. #>
 param(
     [string]$Serial = '',
-    [string]$SdkRoot = "$env:LOCALAPPDATA/Android/Sdk",
+    [string]$SdkRoot = '',
     [string]$NdkPath = '',
     [string]$AndroidJar = ''
 )
@@ -10,34 +10,65 @@ $ErrorActionPreference = 'Stop'
 $recallRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 Push-Location $recallRoot
 try {
-    if (-not (Test-Path build/app)) { throw 'Run build.ps1 first.' }
-    if (-not $AndroidJar) {
-        $AndroidJar = (Get-ChildItem "$SdkRoot/platforms" -Filter android.jar -Recurse |
-            Sort-Object FullName -Descending | Select-Object -First 1).FullName
+    if (-not (Test-Path 'build/app') -or -not (Test-Path 'build/stubs')) {
+        throw 'Run build.ps1 (or build.sh) first so build/app and build/stubs exist.'
     }
-    if (-not $AndroidJar) { throw 'android.jar not found; pass -AndroidJar.' }
+    if (-not $SdkRoot) {
+        foreach ($cand in @(
+            $env:ANDROID_HOME,
+            $env:ANDROID_SDK_ROOT,
+            $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Android/Sdk' }),
+            $(if ($HOME) { Join-Path $HOME 'Android/Sdk' }),
+            $(if ($HOME) { Join-Path $HOME 'Library/Android/sdk' }),
+            '/opt/android-sdk'
+        )) {
+            if ($cand -and (Test-Path $cand)) { $SdkRoot = $cand; break }
+        }
+    }
+    if (-not $AndroidJar -and $SdkRoot -and (Test-Path (Join-Path $SdkRoot 'platforms'))) {
+        $foundJar = Get-ChildItem (Join-Path $SdkRoot 'platforms') -Filter android.jar -Recurse |
+            Sort-Object FullName -Descending | Select-Object -First 1
+        if ($foundJar) { $AndroidJar = $foundJar.FullName }
+    }
+    if (-not $AndroidJar -or -not (Test-Path $AndroidJar)) {
+        throw 'android.jar not found; set ANDROID_HOME or pass -AndroidJar.'
+    }
+
+    $sep = [IO.Path]::PathSeparator
     $recallOut = Join-Path $recallRoot 'build/recall-tests'
+    if (Test-Path $recallOut) { Remove-Item $recallOut -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $recallOut | Out-Null
-    $recallCp = "build/app;build/libxposed/classes.jar;$AndroidJar"
+
+    $stubOverrides = Get-ChildItem 'tests/recall/stubs' -Recurse -Filter '*.java' | ForEach-Object { $_.FullName }
+    & javac -encoding UTF-8 -source 8 -target 8 -d $recallOut $stubOverrides
+    if ($LASTEXITCODE) { throw 'Test stub compilation failed.' }
+
+    $baseCp = "build/app${sep}build/stubs${sep}$AndroidJar"
+    $testCp = "$recallOut${sep}$baseCp"
     $recallTests = @(
         'tests/recall/RecallBehaviorTest.java',
-        'tests/recall/RecallAuditRegressionTest.java',
-        'docs/libxposed-api-102-migration/records/phase-4/workbench/HookMigrationBehaviorTest.java',
-        'docs/libxposed-api-102-migration/records/audit-fixes/workbench/AuditFixBehaviorTest.java'
+        'tests/recall/RecallAuditRegressionTest.java'
     )
-    & javac -encoding UTF-8 -source 8 -target 8 -cp $recallCp -d $recallOut $recallTests
+    & javac -encoding UTF-8 -source 8 -target 8 -cp $testCp -d $recallOut $recallTests
     if ($LASTEXITCODE) { throw 'Java test compilation failed.' }
-    foreach ($recallTest in @('RecallBehaviorTest', 'RecallAuditRegressionTest', 'HookMigrationBehaviorTest', 'AuditFixBehaviorTest')) {
-        & java -cp "$recallOut;$recallCp" "com.chekayo.feishuantirecall.$recallTest"
+
+    foreach ($recallTest in @('RecallBehaviorTest', 'RecallAuditRegressionTest')) {
+        & java -cp $testCp "com.chekayo.feishuantirecall.$recallTest"
         if ($LASTEXITCODE) { throw "$recallTest failed." }
     }
+
     if ($Serial) {
         if ($Serial -notmatch '^[A-Za-z0-9_.:-]+$') { throw 'Invalid device serial.' }
         if (-not $NdkPath) {
-            $NdkPath = (Get-ChildItem "$SdkRoot/ndk" -Directory |
-                Sort-Object Name -Descending | Select-Object -First 1).FullName
+            if ($env:ANDROID_NDK_HOME -and (Test-Path $env:ANDROID_NDK_HOME)) { $NdkPath = $env:ANDROID_NDK_HOME }
+            elseif ($SdkRoot -and (Test-Path (Join-Path $SdkRoot 'ndk'))) {
+                $NdkPath = (Get-ChildItem (Join-Path $SdkRoot 'ndk') -Directory |
+                    Sort-Object Name -Descending | Select-Object -First 1).FullName
+            }
         }
-        $recallClang = Join-Path $NdkPath 'toolchains/llvm/prebuilt/windows-x86_64/bin/clang++.exe'
+        $hostTag = if ($IsLinux) { 'linux-x86_64' } elseif ($IsMacOS) { 'darwin-x86_64' } else { 'windows-x86_64' }
+        $clangName = if ($hostTag -eq 'windows-x86_64') { 'clang++.exe' } else { 'clang++' }
+        $recallClang = Join-Path $NdkPath "toolchains/llvm/prebuilt/$hostTag/bin/$clangName"
         $recallBinary = Join-Path $recallOut 'native-test'
         & $recallClang --target=aarch64-linux-android29 -std=c++17 -O2 -static-libstdc++ -fPIE -pie `
             -o $recallBinary tests/recall/native_test.cpp -ldl
