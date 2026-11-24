@@ -98,7 +98,7 @@ build.sh / build.ps1    一键构建（Linux / Windows）
 发布形态：
 
 - **本仓库**：每个版本一个 Release 挂两个包（`feishukit-<版本>-legacy.apk` / `feishukit-<版本>-api102.apk`）+ 选择说明表。
-- **模块市场镜像（Xposed-Modules-Repo）**：保持两个 Release——稳定版单 APK（Latest，市场更新器只认单资产，绝不多包同 Release）+ api102 prerelease。市场永远只向 legacy 用户推 legacy 包。
+- **模块市场镜像（Xposed-Modules-Repo）**：同样双包发布（经实际使用验证市场更新器处理正常），稳定版标记 Latest。
 - api102 线在旧框架上不会生效；拿不准选哪个就装 legacy。
 - 待 legacy 用户迁移完成（或主流框架仅支持新 API）后，api102 合回 main 转正。
 
