@@ -20,6 +20,7 @@ jobs:
   gate:
     name: 门禁检查
     runs-on: ubuntu-latest
+    timeout-minutes: 45   # 防卡死长跑(与 main 对齐)
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
