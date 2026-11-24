@@ -1,11 +1,11 @@
 {
-  "versionCode": 1033,
-  "versionName": "1.8.11-api102",
+  "versionCode": 1037,
+  "versionName": "1.8.15-api102",
   "channel": "https://t.me/fucklark",
-  "changelog": "· 修复飞书 8.2.6 自身撤回失效 + 撤回气泡与只读交互优化\n· 感谢 @HansYeoh（#11）\n· 修复飞书 8.x（含 8.1.12）「回复才已读」失效：载体签名形状自动发现 + 浏览暂存/回复重放\n· 感谢 @HansYeoh（#8，api102 线实现）\n· 预览版：从 legacy Xposed API 迁移到 libxposed API 102（单模 modern）\n· 仅供支持 libxposed API 102 的新框架（如 LSPosed v2.2+）；老 LSPosed 用户请用 legacy 稳定版\n· 功能与 legacy 版一致，native 层相同；框架交互方式全面替换\n· 感谢 HansYeoh（PR #7）",
+  "changelog": "· 时间常驻锚点动态获取优化移植至 api102 线（与 legacy 对齐）\n· CI job 加 45 分钟超时上限\n· 修复飞书 8.2.6 自身撤回失效 + 撤回气泡与只读交互优化\n· 感谢 @HansYeoh（#11）\n· 修复飞书 8.x（含 8.1.12）「回复才已读」失效：载体签名形状自动发现 + 浏览暂存/回复重放\n· 感谢 @HansYeoh（#8，api102 线实现）\n· 预览版：从 legacy Xposed API 迁移到 libxposed API 102（单模 modern）\n· 仅供支持 libxposed API 102 的新框架（如 LSPosed v2.2+）；老 LSPosed 用户请用 legacy 稳定版\n· 功能与 legacy 版一致，native 层相同；框架交互方式全面替换\n· 感谢 HansYeoh（PR #7）",
   "downloads": [
-    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1033-1.8.11-api102",
+    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1037-1.8.15-api102",
     "https://t.me/fucklark"
   ],
-  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1033-1.8.11-api102"
+  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/1037-1.8.15-api102"
 }
