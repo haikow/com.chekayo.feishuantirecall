@@ -258,8 +258,8 @@ public class ResignTracker implements IXposedHookLoadPackage, IXposedHookZygoteI
                 long now = System.currentTimeMillis();
                 for (int i = 0; i < snap.length(); i++) {
                     JSONObject r = snap.getJSONObject(i);
-                    String id = r.optString("id", "");
-                    if (id.isEmpty()) continue;
+                    String id = r.optString("id", "").trim();
+                    if (!ProfileBulk.isValidNumericUid(id)) continue;
                     JSONObject e = all.optJSONObject(id);
                     if (e == null) { e = new JSONObject(); e.put("first_seen", now); }
                     e.put("id", id);

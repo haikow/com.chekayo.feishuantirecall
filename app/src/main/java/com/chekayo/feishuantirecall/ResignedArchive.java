@@ -11,8 +11,10 @@ final class ResignedArchive {
         Iterator<String> ids = profiles.keys();
         while (ids.hasNext()) {
             String id = ids.next();
+            if (!ProfileBulk.isValidStoredKey(id)) continue;
             JSONObject profile = profiles.optJSONObject(id);
             if (profile == null || !profile.optBoolean("is_resigned", false)) continue;
+            if (profile.optInt("chatter_type", 0) == DataViews.CHATTER_TYPE_BOT) continue;
             JSONObject entry = result.optJSONObject(id);
             if (entry == null) {
                 entry = new JSONObject();

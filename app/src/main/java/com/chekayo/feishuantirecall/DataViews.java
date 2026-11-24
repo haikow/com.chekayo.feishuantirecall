@@ -1277,23 +1277,36 @@ final class DataViews {
     }
 
     // ── 全员档案分类与列表 ──────────────────────────────────────────
-    // 优先级：已离职 > 外部 > 部门 > 邮箱
-    //   有部门 → 同事（哪怕没有邮箱）
-    //   无部门但有邮箱 → 同事
-    //   无部门且无邮箱 → 机器人
+    // 优先级：
+    //   1) 飞书真实成员类型 chatter_type == 2 (BOT) → 机器人
+    //   2) 已离职 → 离职
+    //   3) 非本公司租户 (is_home == false) → 外部
+    //   4) 飞书真实成员类型 chatter_type == 1 (USER) → 同事（即使尚未缓存 V3 部门/邮箱）
+    //   5) 兼容历史无 chatter_type 记录：有任意资料明细 → 同事；否则暂归机器人（下次花名册刷新后自动归位）
     static final String KIND_EMPLOYEE = "employee";
     static final String KIND_RESIGNED = "resigned";
     static final String KIND_EXTERNAL = "external";
     static final String KIND_BOT = "bot";
+    static final int CHATTER_TYPE_UNKNOWN = 0;
+    static final int CHATTER_TYPE_USER = 1;
+    static final int CHATTER_TYPE_BOT = 2;
 
-    /** 按档案字段推断类别（展示时计算，兼容旧 profiles.json 无 kind 字段）。 */
+    /** 按档案字段推断类别（展示时计算，兼容旧 profiles.json 无 chatter_type 字段）。 */
     static String classifyProfile(JSONObject pr) {
         if (pr == null) return KIND_EMPLOYEE;
+        int chatterType = pr.optInt("chatter_type", CHATTER_TYPE_UNKNOWN);
+        if (chatterType == CHATTER_TYPE_BOT) return KIND_BOT;
         if (pr.optBoolean("is_resigned", false)) return KIND_RESIGNED;
         if (!pr.optBoolean("is_home", false)) return KIND_EXTERNAL;
-        // 部门优先于邮箱
-        if (!isEmpty(pr.optString("department", ""))) return KIND_EMPLOYEE;
-        if (!isEmpty(pr.optString("email", ""))) return KIND_EMPLOYEE;
+        if (chatterType == CHATTER_TYPE_USER) return KIND_EMPLOYEE;
+        if (!isEmpty(pr.optString("department", ""))
+                || !isEmpty(pr.optString("email", ""))
+                || !isEmpty(pr.optString("employee_id", ""))
+                || !isEmpty(pr.optString("position", ""))
+                || !isEmpty(pr.optString("leader", ""))
+                || !isEmpty(pr.optString("phone", ""))) {
+            return KIND_EMPLOYEE;
+        }
         return KIND_BOT;
     }
 
@@ -1321,12 +1334,19 @@ final class DataViews {
         return 4;
     }
 
-    /** 全员档案人数（读 profiles.json 顶层键数）。 */
+    /** 全员档案人数（仅统计合法 UID 条目，排除历史并发脏键）。 */
     static int profilesCount() {
         try {
             File f = archiveFile("profiles.json");
             if (!f.exists()) return 0;
-            return new JSONObject(Config.read(f)).length();
+            JSONObject all = new JSONObject(Config.read(f));
+            int count = 0;
+            Iterator<String> it = all.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                if (ProfileBulk.isValidStoredKey(k) && all.optJSONObject(k) != null) count++;
+            }
+            return count;
         } catch (Throwable t) { return -1; }
     }
 
@@ -1406,9 +1426,24 @@ final class DataViews {
     private static ProfilesLoadResult loadProfilesInBackground() throws Exception {
         File pf = archiveFile("profiles.json");
         final JSONObject profiles = pf.exists() ? new JSONObject(Config.read(pf)) : new JSONObject();
+        // 自动自愈清洗历史脏键（如旧版并发写盘拼串导致的超长 hex 伪 UID）
+        int cleaned = ProfileBulk.pruneCorruptedEntries(profiles);
+        if (cleaned > 0 && pf.isFile()) {
+            try {
+                synchronized (Config.PROFILES_LOCK) {
+                    JSONObject disk = pf.length() > 0 ? new JSONObject(Config.read(pf)) : new JSONObject();
+                    if (ProfileBulk.pruneCorruptedEntries(disk) > 0) {
+                        ProfileBulk.writeAtomic(pf, disk.toString(1));
+                    }
+                }
+            } catch (Throwable ignored) { }
+        }
         List<String> ids = new ArrayList<String>();
         Iterator<String> it = profiles.keys();
-        while (it.hasNext()) ids.add(it.next());
+        while (it.hasNext()) {
+            String k = it.next();
+            if (ProfileBulk.isValidStoredKey(k)) ids.add(k);
+        }
         Collections.sort(ids, new Comparator<String>() {
             @Override public int compare(String a, String b) {
                 JSONObject pa = profiles.optJSONObject(a), pb = profiles.optJSONObject(b);
@@ -1514,7 +1549,7 @@ final class DataViews {
 
             TextView hint = new TextView(ctx);
             hint.setText(AccountPaths.label(ctx)
-                    + "\n归类：有部门或邮箱 → 同事；无部门且无邮箱 → 机器人；离职/外部单独页签。\n"
+                    + "\n归类：优先按飞书真实成员类型区分同事与机器人；离职/外部单独页签。\n"
                     + "档案与消息按飞书账号隔离，切换账号后各看各的。\n"
                     + "点击顶部页签或 ‹ › 切换分类，上下滑动列表。");
             hint.setTextSize(11);

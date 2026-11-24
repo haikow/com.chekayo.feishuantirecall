@@ -61,6 +61,19 @@ public class JSONObject {
         return map.get(name);
     }
 
+    public JSONObject optJSONObject(String name) {
+        Object v = map.get(name);
+        return v instanceof JSONObject ? (JSONObject) v : null;
+    }
+
+    public boolean has(String name) {
+        return map.containsKey(name);
+    }
+
+    public Object remove(String name) {
+        return map.remove(name);
+    }
+
     public String toString() {
         return "{}";
     }

@@ -473,6 +473,7 @@ public final class RecallBehaviorTest {
 
             testDataMigrationAllowlistAndZipSlip();
             testDiagTruncateUtf8Safety();
+            testProfileSanitizationAndClassification();
 
             System.out.println("PASS: " + checks + " Java recall checks");
         } finally {
@@ -481,5 +482,93 @@ public final class RecallBehaviorTest {
             }
             deleteTree(markerDirectory);
         }
+    }
+
+    private static void testProfileSanitizationAndClassification() {
+        String hexTail = "010a15432d37363031333935383830333635313136333637123c0a06e8818ce58aa1"
+                + "18010a0d542d434f4d4d4f4e5f494e464f";
+        check(ProfileBulk.isValidNumericUid("7123456789012345678"), "valid 19-digit numeric uid accepted");
+        check(!ProfileBulk.isValidNumericUid(""), "empty uid rejected");
+        check(!ProfileBulk.isValidNumericUid(hexTail), "corrupted hex protobuf tail rejected as numeric uid");
+        check(!ProfileBulk.isValidNumericUid("1234567890123456789012345"), "overlong numeric uid rejected");
+        check(ProfileBulk.isValidStoredKey("7123456789012345678"), "numeric stored key valid");
+        check(ProfileBulk.isValidStoredKey("name:张三"), "ProfileCapture name fallback key valid");
+        check(!ProfileBulk.isValidStoredKey(hexTail), "hex tail stored key rejected");
+        check(!ProfileBulk.isValidStoredKey("name:"), "empty name fallback key rejected");
+        check(!ProfileBulk.isValidStoredKey("name:bad\u0007name"), "control char name key rejected");
+
+        org.json.JSONObject all = new org.json.JSONObject();
+        org.json.JSONObject validEmp = new org.json.JSONObject()
+                .put("id", "7123456789012345678")
+                .put("name", "张三")
+                .put("is_home", true)
+                .put("chatter_type", 1)
+                .put("company", "坏公司\uFFFD\u0001");
+        org.json.JSONObject validFallback = new org.json.JSONObject()
+                .put("name", "李四")
+                .put("is_home", true);
+        org.json.JSONObject corruptHex = new org.json.JSONObject()
+                .put("id", hexTail)
+                .put("is_resigned", false);
+        all.put("7123456789012345678", validEmp);
+        all.put("name:李四", validFallback);
+        all.put(hexTail, corruptHex);
+
+        int cleaned = ProfileBulk.pruneCorruptedEntries(all);
+        check(cleaned == 2, "prune removes hex garbage key and invalid company");
+        check(!all.has(hexTail), "corrupted hex key removed from profiles.json");
+        check(all.has("7123456789012345678") && all.has("name:李四"), "valid entries preserved after prune");
+        check(validEmp.optString("company", "").isEmpty(), "garbled company cleared");
+
+        // protobuf field 1 -> field 3 -> field 1: binary bytes rejected, valid UTF-8 accepted
+        byte[] badCompanyBlob = new byte[]{
+                0x0a, 0x0a, 0x1a, 0x08, 0x0a, 0x06, 0x08, 0x01, 0x12, 0x02, 0x00, 0x01
+        };
+        check(ProfileBulk.companyName(badCompanyBlob) == null, "binary protobuf in companyName rejected");
+        byte[] okCompanyBlob = new byte[]{
+                0x0a, 0x08, 0x1a, 0x06, 0x0a, 0x04, 'A', 'c', 'm', 'e'
+        };
+        check("Acme".equals(ProfileBulk.companyName(okCompanyBlob)), "valid UTF-8 companyName extracted");
+
+        // classifyProfile: real human without V3 dept/email stays employee, not bot
+        org.json.JSONObject humanNoV3 = new org.json.JSONObject()
+                .put("is_home", true).put("is_resigned", false).put("chatter_type", 1);
+        check(DataViews.KIND_EMPLOYEE.equals(DataViews.classifyProfile(humanNoV3)),
+                "real human colleague without V3 profile classified as employee");
+
+        org.json.JSONObject homeBot = new org.json.JSONObject()
+                .put("is_home", true).put("is_resigned", false).put("chatter_type", 2);
+        check(DataViews.KIND_BOT.equals(DataViews.classifyProfile(homeBot)),
+                "home chatter_type=2 classified as bot");
+
+        org.json.JSONObject extBot = new org.json.JSONObject()
+                .put("is_home", false).put("is_resigned", false).put("chatter_type", 2);
+        check(DataViews.KIND_BOT.equals(DataViews.classifyProfile(extBot)),
+                "cross-tenant/system chatter_type=2 classified as bot rather than external");
+
+        org.json.JSONObject resignedBot = new org.json.JSONObject()
+                .put("is_home", true).put("is_resigned", true).put("chatter_type", 2);
+        check(DataViews.KIND_BOT.equals(DataViews.classifyProfile(resignedBot)),
+                "resigned bot stays bot rather than resigned employee");
+
+        org.json.JSONObject extHuman = new org.json.JSONObject()
+                .put("is_home", false).put("is_resigned", false).put("chatter_type", 1);
+        check(DataViews.KIND_EXTERNAL.equals(DataViews.classifyProfile(extHuman)),
+                "external human classified as external");
+
+        org.json.JSONObject resignedHuman = new org.json.JSONObject()
+                .put("is_home", true).put("is_resigned", true).put("chatter_type", 1);
+        check(DataViews.KIND_RESIGNED.equals(DataViews.classifyProfile(resignedHuman)),
+                "resigned human classified as resigned");
+
+        org.json.JSONObject legacyEmpId = new org.json.JSONObject()
+                .put("is_home", true).put("is_resigned", false).put("employee_id", "E1001");
+        check(DataViews.KIND_EMPLOYEE.equals(DataViews.classifyProfile(legacyEmpId)),
+                "legacy entry with employee_id but no dept/email classified as employee");
+
+        org.json.JSONObject legacyEmpty = new org.json.JSONObject()
+                .put("is_home", true).put("is_resigned", false);
+        check(DataViews.KIND_BOT.equals(DataViews.classifyProfile(legacyEmpty)),
+                "legacy entry without chatter_type or fields falls back to bot");
     }
 }

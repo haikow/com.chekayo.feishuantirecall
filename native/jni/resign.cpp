@@ -78,35 +78,35 @@ static std::string g_dump_path;
 static std::string g_dump_target_uid;
 static int g_dump_result = -999;       // -999=pending, >=0=累计行数, 负=错误
 static uint64_t g_dump_gen = 0;
-static std::unordered_set<void*> g_dumped_this_arm;
+static std::unordered_set<std::string> g_dumped_this_arm;
 
 // ── V3 富资料批量 dump: 查 chatter_profiles_v3 JOIN chatters, 把每人 blob 原样写 JSONL(hex) ──
-// (protobuf 解析太绕, 放 Java 层做; native 只负责就地把 blob 掏出来落文件)
+// (protobuf 解析太绕, 放 Java 层做; native 只负责就地把 blob 掏出来原子落文件)
 static bool g_prof_pending = false;
 static std::string g_prof_path;
 static std::string g_prof_target_uid;
-static int g_prof_result = -999;       // -999=pending, >=0=累计行数, 负=错误
-static int g_prof_rows = 0;            // 本 arm 周期累计行数
-static int g_prof_written = 0;         // 本 arm 周期已落盘句柄数(0="w", >0="a")
+static int g_prof_result = -999;       // -999=pending, >=0=行数, 负=错误
 static uint64_t g_prof_gen = 0;
-static std::unordered_set<void*> g_prof_dumped_this_arm;
+static std::unordered_set<std::string> g_prof_dumped_this_arm;
 
 // ── 全量花名册 dump: 查【全部】chatters(不限 is_resigned), LEFT JOIN v3 富资料。
-//    区别于 doProfileDump(只写有 blob 的人): 本 dump 覆盖全员, 没资料的人也落 name/tenant_id,
-//    补齐「组织架构巡游」时无 profile 的同事姓名。输出 JSONL(同 doProfileDump 行格式,
-//    hex 可空), 由 Java ProfileBulk.mergeRoster 解析并入 profiles.json。
+//    区别于 doProfileDump(只写有 blob 的人): 本 dump 覆盖全员, 没资料的人也落 name/tenant_id/type,
+//    补齐「组织架构巡游」时无 profile 的同事姓名与真实成员类型。输出 JSONL 原子落盘,
+//    由 Java ProfileBulk.mergeRoster 解析并入 profiles.json。
 static bool g_roster_pending = false;
 static std::string g_roster_path;
 static std::string g_roster_target_uid;
-static int g_roster_result = -999;     // -999=pending, >=0=累计行数, 负=错误
-static int g_roster_rows = 0;          // 本 arm 周期累计行数
-static int g_roster_written = 0;       // 本 arm 周期已落盘句柄数(0="w", >0="a")
+static int g_roster_result = -999;     // -999=pending, >=0=行数, 负=错误
 static uint64_t g_roster_gen = 0;
-static std::unordered_set<void*> g_roster_dumped_this_arm;
+static std::unordered_set<std::string> g_roster_dumped_this_arm;
 
 // ── 跨句柄 union: 按 id O(1) 去重累积当前账号所有离职行(无 6000 上限, 切账号时清空) ──
 static std::unordered_map<std::string, std::string> g_union_rows;
 static std::string g_union_uid;
+
+static void update_any_pending_locked() {
+    g_any_pending.store(g_dump_pending || g_prof_pending || g_roster_pending, std::memory_order_release);
+}
 
 static long resign_now_ms() {
     struct timespec ts;
@@ -114,7 +114,17 @@ static long resign_now_ms() {
     return (long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-// 从输出路径解析目标账号 uid: 提取 /accounts/<uid>/ 段; 若不存在或为 "unknown" 返回空串(兜底放行)。
+static bool is_valid_numeric_id(const char* s) {
+    if (!s || !*s) return false;
+    size_t n = 0;
+    for (const char* p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+        if (++n > 24) return false;
+    }
+    return n > 0;
+}
+
+// 从输出路径解析目标账号目录名: 提取 /accounts/<uid>/ 段; 若不存在或为 "unknown" 返回空串(兜底放行)。
 static std::string extract_account_uid(const std::string &path) {
     const std::string marker = "/accounts/";
     size_t p = path.find(marker);
@@ -126,11 +136,72 @@ static std::string extract_account_uid(const std::string &path) {
     return uid;
 }
 
-// 多账号隔离: 若目标路径含明确账号且 contact.db 路径(经 recall::owner 映射)也属于明确账号,
-// 则仅当两者一致时允许写入; 任一方未知(单账号/旧路径/未绑定哈希目录)时兜底放行。
-static bool uid_matches_target(const std::string &db_uid, const std::string &target_uid) {
-    if (target_uid.empty() || db_uid.empty()) return true;
-    return db_uid == target_uid;
+// 从 contact.db 路径提取 /sdk_storage/<dir>/ 段(兼容飞书 8.x 哈希目录与 7.x 数字 UID 目录)。
+static std::string extract_storage_dir(const char* fn) {
+    if (!fn) return "";
+    std::string path(fn);
+    const std::string marker = "/sdk_storage/";
+    size_t p = path.find(marker);
+    if (p == std::string::npos) return "";
+    p += marker.size();
+    size_t e = path.find('/', p);
+    if (e == std::string::npos || e == p) return "";
+    return path.substr(p, e - p);
+}
+
+// 多账号隔离: 若目标路径含明确账号标识, 则匹配 recall::owner(数字 UID) 或 sdk_storage 目录名(8.x 哈希);
+// 任一方未知(单账号/旧路径)时兜底放行。
+static bool uid_matches_target(const std::string &db_uid, const std::string &db_storage, const std::string &target_uid) {
+    if (target_uid.empty()) return true;
+    if (!db_storage.empty() && db_storage == target_uid) return true;
+    if (!db_uid.empty() && db_uid == target_uid) return true;
+    if (db_uid.empty() && db_storage.empty()) return true;
+    return false;
+}
+
+struct ChattersCols {
+    std::string type_col;      // "type" 或 "chatter_type", 不存在则为空
+    bool has_another_name = false;
+    bool has_alias = false;
+    bool has_en_us_name = false;
+};
+
+// 动态探测 chatters 表列(兼容飞书 7.x / 8.x 不同 schema, 绝不因缺列导致 SELECT 失败)。
+static ChattersCols probe_chatters_cols(RProv* pv, void* db) {
+    ChattersCols cols;
+    void* stmt = nullptr;
+    if (pv->orig_prepare(db, "PRAGMA table_info(chatters)", -1, &stmt, nullptr) != 0 || !stmt) {
+        return cols;
+    }
+    while (pv->step(stmt) == 100 /*SQLITE_ROW*/) {
+        const unsigned char* nm = pv->coltext(stmt, 1);
+        if (!nm) continue;
+        const char* s = (const char*) nm;
+        if (strcmp(s, "type") == 0) cols.type_col = "type";
+        else if (strcmp(s, "chatter_type") == 0 && cols.type_col.empty()) cols.type_col = "chatter_type";
+        else if (strcmp(s, "another_name") == 0) cols.has_another_name = true;
+        else if (strcmp(s, "alias") == 0) cols.has_alias = true;
+        else if (strcmp(s, "en_us_name") == 0) cols.has_en_us_name = true;
+    }
+    pv->finalize(stmt);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        LOGI("chatters schema probed: type_col=%s another=%d alias=%d en_us=%d",
+             cols.type_col.empty() ? "(none)" : cols.type_col.c_str(),
+             cols.has_another_name ? 1 : 0, cols.has_alias ? 1 : 0, cols.has_en_us_name ? 1 : 0);
+    }
+    return cols;
+}
+
+static std::string build_alt_name_expr(const ChattersCols &cols) {
+    std::string expr = "COALESCE(";
+    bool any = false;
+    if (cols.has_another_name) { expr += "NULLIF(c.another_name,''),"; any = true; }
+    if (cols.has_alias)        { expr += "NULLIF(c.alias,''),"; any = true; }
+    if (cols.has_en_us_name)   { expr += "NULLIF(c.en_us_name,''),"; any = true; }
+    if (!any) return "''";
+    expr += "'')";
+    return expr;
 }
 
 static void jesc(char* dst, size_t cap, const char* s) {   // JSON 字符串转义(不含引号)
@@ -176,10 +247,15 @@ static bool writeUnionFile(const std::string &path, const std::vector<std::strin
 // 注: chatters 表无真实离职时间列(update_time=本地行刷新时刻; expire_time=缓存TTL,未来日期;
 //     work_status 空)。真实离职日期只在服务器端, 未缓存本地 -> 客户端无法据此排序。
 static void doDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
-    const char* sql = "SELECT id, name, en_us_name, alias, another_name, tenant_id, update_time, is_frozen "
-                      "FROM chatters WHERE is_resigned=1 ORDER BY update_time DESC";
+    ChattersCols cols = probe_chatters_cols(pv, db);
+    std::string sql = "SELECT id, name, en_us_name, alias, another_name, tenant_id, update_time, is_frozen "
+                      "FROM chatters WHERE is_resigned=1";
+    if (!cols.type_col.empty()) {
+        sql += " AND (" + cols.type_col + " IS NULL OR " + cols.type_col + "!=2)";
+    }
+    sql += " ORDER BY update_time DESC";
     void* stmt = nullptr;
-    int rc = pv->orig_prepare(db, sql, -1, &stmt, nullptr);
+    int rc = pv->orig_prepare(db, sql.c_str(), -1, &stmt, nullptr);
     if (rc != 0 || !stmt) {
         LOGE("doDump prepare rc=%d", rc);
         std::lock_guard<std::mutex> guard(g_resign_lock);
@@ -194,7 +270,7 @@ static void doDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
     std::vector<std::pair<std::string, std::string>> local_rows;
     while (pv->step(stmt) == 100 /*SQLITE_ROW*/) {
         const char* id = col(0);
-        if (!id || !*id) continue;
+        if (!is_valid_numeric_id(id)) continue;
         char e_id[64], e_name[256], e_en[256], e_alias[256], e_ann[256], e_tid[64], e_ut[64], e_fz[16];
         jesc(e_id, sizeof(e_id), col(0));
         jesc(e_name, sizeof(e_name), col(1));
@@ -234,148 +310,48 @@ static void doDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
         std::lock_guard<std::mutex> guard(g_resign_lock);
         if (g_dump_gen == gen) {
             g_dump_result = wrote ? total : -3;
+            if (wrote && !g_dump_target_uid.empty()) {
+                g_dump_pending = false;
+                update_any_pending_locked();
+            }
         }
     }
     LOGI("doDump handle=%p +%d rows, union=%d wrote=%d", db, added, total, wrote ? 1 : 0);
 }
 
-// V3 富资料批量 dump: chatter_profiles_v3 JOIN chatters -> JSONL(每行一个 {chatter_id,tenant_id,name,is_resigned,hex})
-// 本 arm 首个句柄 "w" 清空, 其余同账号句柄 "a" 追加。blob 以 hex 落, Java 解 protobuf。
-static void doProfileDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
-    const char* sql =
-        "SELECT v.chatter_id, c.tenant_id, c.name, c.is_resigned, v.profile "
-        "FROM chatter_profiles_v3 v JOIN chatters c ON c.id=v.chatter_id "
-        "WHERE v.profile IS NOT NULL AND length(v.profile)>0";
-    void* stmt = nullptr;
-    int rc = pv->orig_prepare(db, sql, -1, &stmt, nullptr);
-    if (rc != 0 || !stmt) {
-        LOGE("doProfileDump prepare rc=%d", rc);
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_prof_gen == gen && g_prof_result == -999) g_prof_result = -2;
-        return;
-    }
-
-    std::lock_guard<std::mutex> io_guard(g_prof_io_lock);
-    const char* mode = "w";
-    {
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_prof_gen != gen) { pv->finalize(stmt); return; }
-        mode = (g_prof_written == 0) ? "w" : "a";
-    }
-
-    FILE* out = fopen(path.c_str(), mode);
-    if (!out) {
-        pv->finalize(stmt);
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_prof_gen == gen && g_prof_result == -999) g_prof_result = -3;
-        return;
-    }
+// 共享 JSONL 原子写出(供 doProfileDump 与 doRosterDump 共用):
+// 写临时文件 -> 校验 fclose -> 原子 rename 发布, 杜绝多线程交错拼串或 Java 读半截文件。
+static int dump_profile_jsonl(RProv* pv, void* stmt, const std::string &path, uint64_t gen, bool require_blob) {
+    std::string tmp = path + ".tmp." + std::to_string(gen);
+    FILE* out = fopen(tmp.c_str(), "w");
+    if (!out) return -3;
 
     static const char HEX[] = "0123456789abcdef";
     std::string hb;
     int added = 0;
     while (pv->step(stmt) == 100 /*SQLITE_ROW*/) {
-        // 先读 4 个文本列, 再读 blob 列(不同列, 不触发同列类型转换失效)
-        const unsigned char* cid = pv->coltext(stmt, 0);
-        const unsigned char* tid = pv->coltext(stmt, 1);
-        const unsigned char* nm  = pv->coltext(stmt, 2);
-        const unsigned char* rs  = pv->coltext(stmt, 3);
-        const unsigned char* blob = (const unsigned char*) pv->colblob(stmt, 4);
-        int bn = pv->colbytes(stmt, 4);
-        if (!blob || bn <= 0) continue;
-        char e_cid[64], e_tid[64], e_nm[256], e_rs[16];
-        jesc(e_cid, sizeof(e_cid), cid ? (const char*) cid : "");
-        jesc(e_tid, sizeof(e_tid), tid ? (const char*) tid : "");
-        jesc(e_nm,  sizeof(e_nm),  nm  ? (const char*) nm  : "");
-        jesc(e_rs,  sizeof(e_rs),  rs  ? (const char*) rs  : "");
-        fprintf(out, "{\"chatter_id\":\"%s\",\"tenant_id\":\"%s\",\"name\":\"%s\",\"is_resigned\":\"%s\",\"hex\":\"",
-                e_cid, e_tid, e_nm, e_rs);
-        hb.resize((size_t) bn * 2);
-        for (int i = 0; i < bn; i++) {
-            hb[(size_t) i * 2]     = HEX[blob[i] >> 4];
-            hb[(size_t) i * 2 + 1] = HEX[blob[i] & 0xf];
-        }
-        fwrite(hb.data(), 1, hb.size(), out);
-        fputs("\"}\n", out);
-        added++;
-    }
-    pv->finalize(stmt);
-    fclose(out);
+        const unsigned char* cid   = pv->coltext(stmt, 0);
+        const unsigned char* tid   = pv->coltext(stmt, 1);
+        const unsigned char* nm    = pv->coltext(stmt, 2);
+        const unsigned char* rs    = pv->coltext(stmt, 3);
+        const unsigned char* ctype = pv->coltext(stmt, 4);
+        const unsigned char* alt   = pv->coltext(stmt, 5);
+        const unsigned char* blob  = (const unsigned char*) pv->colblob(stmt, 6);
+        int bn = pv->colbytes(stmt, 6);
+        if (!is_valid_numeric_id((const char*) cid)) continue;
+        if (require_blob && (!blob || bn <= 0)) continue;
 
-    int total = 0;
-    {
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_prof_gen == gen) {
-            g_prof_written++;
-            g_prof_rows += added;
-            g_prof_result = g_prof_rows;
-            total = g_prof_rows;
-        }
-    }
-    LOGI("doProfileDump handle=%p +%d rows (mode=%s) total=%d", db, added, mode, total);
-}
-
-// 全量花名册 dump: 全部 chatters LEFT JOIN v3 -> JSONL(每行 {chatter_id,tenant_id,name,is_resigned,hex})
-// 与 doProfileDump 同结构, 但 LEFT JOIN 覆盖全员(无 profile 的人 hex="" 仍落, 补齐无资料者的姓名)。
-// 本 arm 首个句柄 "w" 清空, 其余同账号句柄 "a" 追加。
-static void doRosterDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
-    // chatter_profiles_v3 可能不存在(老库/未登录富资料) -> 探测后决定 SQL
-    bool hasV3 = false;
-    {
-        void* chk = nullptr;
-        if (pv->orig_prepare(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatter_profiles_v3' LIMIT 1", -1, &chk, nullptr) == 0 && chk) {
-            if (pv->step(chk) == 100 /*ROW*/) hasV3 = true;
-            pv->finalize(chk);
-        }
-    }
-    // LEFT JOIN: 全员都落, 有富资料的顺带把 blob hex 带上
-    const char* sql = hasV3
-        ? "SELECT c.id, c.tenant_id, c.name, c.is_resigned, v.profile "
-          "FROM chatters c LEFT JOIN chatter_profiles_v3 v ON v.chatter_id=c.id"
-        : "SELECT c.id, c.tenant_id, c.name, c.is_resigned, NULL AS profile FROM chatters c";
-    void* stmt = nullptr;
-    int rc = pv->orig_prepare(db, sql, -1, &stmt, nullptr);
-    if (rc != 0 || !stmt) {
-        LOGE("doRosterDump prepare rc=%d", rc);
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_roster_gen == gen && g_roster_result == -999) g_roster_result = -2;
-        return;
-    }
-
-    std::lock_guard<std::mutex> io_guard(g_roster_io_lock);
-    const char* mode = "w";
-    {
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_roster_gen != gen) { pv->finalize(stmt); return; }
-        mode = (g_roster_written == 0) ? "w" : "a";
-    }
-
-    FILE* out = fopen(path.c_str(), mode);
-    if (!out) {
-        pv->finalize(stmt);
-        std::lock_guard<std::mutex> guard(g_resign_lock);
-        if (g_roster_gen == gen && g_roster_result == -999) g_roster_result = -3;
-        return;
-    }
-
-    static const char HEX[] = "0123456789abcdef";
-    std::string hb;
-    int added = 0;
-    while (pv->step(stmt) == 100 /*SQLITE_ROW*/) {
-        const unsigned char* cid = pv->coltext(stmt, 0);
-        const unsigned char* tid = pv->coltext(stmt, 1);
-        const unsigned char* nm  = pv->coltext(stmt, 2);
-        const unsigned char* rs  = pv->coltext(stmt, 3);
-        if (!cid || !*cid) continue;            // 空 id 跳过
-        char e_cid[64], e_tid[64], e_nm[256], e_rs[16];
+        char e_cid[64], e_tid[64], e_nm[256], e_rs[16], e_ct[16];
         jesc(e_cid, sizeof(e_cid), (const char*) cid);
         jesc(e_tid, sizeof(e_tid), tid ? (const char*) tid : "");
-        jesc(e_nm,  sizeof(e_nm),  nm  ? (const char*) nm  : "");
-        jesc(e_rs,  sizeof(e_rs),  rs  ? (const char*) rs  : "");
-        const unsigned char* blob = (const unsigned char*) pv->colblob(stmt, 4);
-        int bn = pv->colbytes(stmt, 4);
-        fprintf(out, "{\"chatter_id\":\"%s\",\"tenant_id\":\"%s\",\"name\":\"%s\",\"is_resigned\":\"%s\",\"hex\":\"",
-                e_cid, e_tid, e_nm, e_rs);
+        const char* raw_nm = (nm && *nm) ? (const char*) nm : (alt ? (const char*) alt : "");
+        jesc(e_nm,  sizeof(e_nm),  raw_nm);
+        jesc(e_rs,  sizeof(e_rs),  rs ? (const char*) rs : "");
+        jesc(e_ct,  sizeof(e_ct),  ctype ? (const char*) ctype : "");
+
+        fprintf(out,
+                "{\"chatter_id\":\"%s\",\"tenant_id\":\"%s\",\"name\":\"%s\",\"is_resigned\":\"%s\",\"chatter_type\":\"%s\",\"hex\":\"",
+                e_cid, e_tid, e_nm, e_rs, e_ct);
         if (blob && bn > 0) {
             hb.resize((size_t) bn * 2);
             for (int i = 0; i < bn; i++) {
@@ -387,25 +363,111 @@ static void doRosterDump(RProv* pv, void* db, const std::string &path, uint64_t 
         fputs("\"}\n", out);
         added++;
     }
-    pv->finalize(stmt);
-    fclose(out);
 
-    int total = 0;
+    bool ok = !ferror(out);
+    if (fclose(out) != 0) ok = false;
+    if (!ok) {
+        remove(tmp.c_str());
+        return -3;
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        remove(tmp.c_str());
+        return -3;
+    }
+    return added;
+}
+
+// V3 富资料批量 dump: chatter_profiles_v3 JOIN chatters -> 原子落 JSONL。
+static void doProfileDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
+    ChattersCols cols = probe_chatters_cols(pv, db);
+    std::string typeExpr = cols.type_col.empty() ? "''" : ("c." + cols.type_col);
+    std::string altExpr = build_alt_name_expr(cols);
+    std::string sql =
+        "SELECT v.chatter_id, c.tenant_id, c.name, c.is_resigned, " + typeExpr + ", " + altExpr + ", v.profile "
+        "FROM chatter_profiles_v3 v JOIN chatters c ON c.id=v.chatter_id "
+        "WHERE v.profile IS NOT NULL AND length(v.profile)>0";
+    void* stmt = nullptr;
+    int rc = pv->orig_prepare(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != 0 || !stmt) {
+        LOGE("doProfileDump prepare rc=%d", rc);
+        std::lock_guard<std::mutex> guard(g_resign_lock);
+        if (g_prof_gen == gen && g_prof_result == -999) g_prof_result = -2;
+        return;
+    }
+
+    std::lock_guard<std::mutex> io_guard(g_prof_io_lock);
+    {
+        std::lock_guard<std::mutex> guard(g_resign_lock);
+        if (g_prof_gen != gen) { pv->finalize(stmt); return; }
+    }
+
+    int res = dump_profile_jsonl(pv, stmt, path, gen, true);
+    pv->finalize(stmt);
+
+    {
+        std::lock_guard<std::mutex> guard(g_resign_lock);
+        if (g_prof_gen == gen) {
+            g_prof_result = res;
+            if (res >= 0) {
+                g_prof_pending = false;
+                update_any_pending_locked();
+            }
+        }
+    }
+    LOGI("doProfileDump handle=%p res=%d", db, res);
+}
+
+// 全量花名册 dump: 全部 chatters LEFT JOIN v3 -> 原子落 JSONL(覆盖全员 + 真实 chatter_type)。
+static void doRosterDump(RProv* pv, void* db, const std::string &path, uint64_t gen) {
+    bool hasV3 = false;
+    {
+        void* chk = nullptr;
+        if (pv->orig_prepare(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatter_profiles_v3' LIMIT 1", -1, &chk, nullptr) == 0 && chk) {
+            if (pv->step(chk) == 100 /*ROW*/) hasV3 = true;
+            pv->finalize(chk);
+        }
+    }
+    ChattersCols cols = probe_chatters_cols(pv, db);
+    std::string typeExpr = cols.type_col.empty() ? "''" : ("c." + cols.type_col);
+    std::string altExpr = build_alt_name_expr(cols);
+    std::string sql = hasV3
+        ? ("SELECT c.id, c.tenant_id, c.name, c.is_resigned, " + typeExpr + ", " + altExpr + ", v.profile "
+           "FROM chatters c LEFT JOIN chatter_profiles_v3 v ON v.chatter_id=c.id")
+        : ("SELECT c.id, c.tenant_id, c.name, c.is_resigned, " + typeExpr + ", " + altExpr + ", NULL AS profile FROM chatters c");
+    void* stmt = nullptr;
+    int rc = pv->orig_prepare(db, sql.c_str(), -1, &stmt, nullptr);
+    if (rc != 0 || !stmt) {
+        LOGE("doRosterDump prepare rc=%d", rc);
+        std::lock_guard<std::mutex> guard(g_resign_lock);
+        if (g_roster_gen == gen && g_roster_result == -999) g_roster_result = -2;
+        return;
+    }
+
+    std::lock_guard<std::mutex> io_guard(g_roster_io_lock);
+    {
+        std::lock_guard<std::mutex> guard(g_resign_lock);
+        if (g_roster_gen != gen) { pv->finalize(stmt); return; }
+    }
+
+    int res = dump_profile_jsonl(pv, stmt, path, gen, false);
+    pv->finalize(stmt);
+
     {
         std::lock_guard<std::mutex> guard(g_resign_lock);
         if (g_roster_gen == gen) {
-            g_roster_written++;
-            g_roster_rows += added;
-            g_roster_result = g_roster_rows;
-            total = g_roster_rows;
+            g_roster_result = res;
+            if (res >= 0) {
+                g_roster_pending = false;
+                update_any_pending_locked();
+            }
         }
     }
-    LOGI("doRosterDump handle=%p +%d rows (mode=%s, v3=%d) total=%d", db, added, mode, hasV3 ? 1 : 0, total);
+    LOGI("doRosterDump handle=%p res=%d (v3=%d, type_col=%s)", db, res, hasV3 ? 1 : 0,
+         cols.type_col.empty() ? "none" : cols.type_col.c_str());
 }
 
 // hook: sqlite3_prepare_v2 —— app 每次 prepare 回调都在 DB 自己的线程上。
-// 抓匹配目标账号的 contact.db, pending 时就地 dump(同线程, 不 MISUSE)。
-// 每个 arm 周期内每个句柄只 dump 一次(避免高频重复); Java 再 add-only 合并进 resigned_all.json。
+// 按 contact.db 文件路径去重(避免 WCDB2 连接池多句柄重复 dump 同一库), 原子落盘交给 Java 合并。
 static int prepare_common(RProv* pv, void* db, const char* sql, int n, void** ppStmt, const char** tail) {
     int rc = pv->orig_prepare(db, sql, n, ppStmt, tail);
     if (!db || !pv->dbfile) return rc;
@@ -415,7 +477,9 @@ static int prepare_common(RProv* pv, void* db, const char* sql, int n, void** pp
     }
     const char* fn = pv->dbfile(db, "main");
     if (!fn || !strstr(fn, "contact.db")) return rc;
+    std::string db_key(fn);
     std::string db_uid = recall::owner(fn);
+    std::string db_storage = extract_storage_dir(fn);
 
     bool run_dump = false, run_prof = false, run_roster = false;
     std::string dump_path, prof_path, roster_path;
@@ -424,25 +488,25 @@ static int prepare_common(RProv* pv, void* db, const char* sql, int n, void** pp
         std::lock_guard<std::mutex> guard(g_resign_lock);
         g_contact_db = db;
         g_has_contact_db.store(true, std::memory_order_release);
-        if (g_dump_pending && g_dumped_this_arm.find(db) == g_dumped_this_arm.end()
-                && uid_matches_target(db_uid, g_dump_target_uid)) {
-            g_dumped_this_arm.insert(db);
+        if (g_dump_pending && g_dumped_this_arm.find(db_key) == g_dumped_this_arm.end()
+                && uid_matches_target(db_uid, db_storage, g_dump_target_uid)) {
+            g_dumped_this_arm.insert(db_key);
             dump_path = g_dump_path;
             dump_gen = g_dump_gen;
             run_dump = !dump_path.empty();
         }
         if (g_prof_pending && pv->colblob && pv->colbytes
-                && g_prof_dumped_this_arm.find(db) == g_prof_dumped_this_arm.end()
-                && uid_matches_target(db_uid, g_prof_target_uid)) {
-            g_prof_dumped_this_arm.insert(db);
+                && g_prof_dumped_this_arm.find(db_key) == g_prof_dumped_this_arm.end()
+                && uid_matches_target(db_uid, db_storage, g_prof_target_uid)) {
+            g_prof_dumped_this_arm.insert(db_key);
             prof_path = g_prof_path;
             prof_gen = g_prof_gen;
             run_prof = !prof_path.empty();
         }
         if (g_roster_pending && pv->colblob && pv->colbytes
-                && g_roster_dumped_this_arm.find(db) == g_roster_dumped_this_arm.end()
-                && uid_matches_target(db_uid, g_roster_target_uid)) {
-            g_roster_dumped_this_arm.insert(db);
+                && g_roster_dumped_this_arm.find(db_key) == g_roster_dumped_this_arm.end()
+                && uid_matches_target(db_uid, db_storage, g_roster_target_uid)) {
+            g_roster_dumped_this_arm.insert(db_key);
             roster_path = g_roster_path;
             roster_gen = g_roster_gen;
             run_roster = !roster_path.empty();
@@ -547,9 +611,9 @@ Java_com_chekayo_larkresign_ResignTracker_nativeArmDump(JNIEnv* env, jclass, jst
     g_dump_target_uid = std::move(uid);
     g_dump_result = -999;
     g_dump_gen++;
-    g_dumped_this_arm.clear();   // 本 arm 周期各 contact.db 句柄重新各 dump 一次
+    g_dumped_this_arm.clear();   // 本 arm 周期每个 contact.db 路径各 dump 一次
     g_dump_pending = true;
-    g_any_pending.store(true, std::memory_order_release);
+    update_any_pending_locked();
     return 0;
 }
 
@@ -561,7 +625,7 @@ Java_com_chekayo_larkresign_ResignTracker_nativePoll(JNIEnv*, jclass) {
     return g_dump_result;
 }
 
-// 请求一次 V3 富资料批量 dump: 记路径+置 pending, 下一次 contact.db prepare 就地把 blob 落 JSONL。
+// 请求一次 V3 富资料批量 dump: 记路径+置 pending, 下一次 contact.db prepare 就地把 blob 原子落 JSONL。
 extern "C" JNIEXPORT jint JNICALL
 Java_com_chekayo_larkresign_ResignTracker_nativeArmProfiles(JNIEnv* env, jclass, jstring jpath) {
     if (!jpath) return -1;
@@ -575,12 +639,10 @@ Java_com_chekayo_larkresign_ResignTracker_nativeArmProfiles(JNIEnv* env, jclass,
     g_prof_path = std::move(p);
     g_prof_target_uid = std::move(uid);
     g_prof_result = -999;
-    g_prof_rows = 0;
-    g_prof_written = 0;
     g_prof_gen++;
-    g_prof_dumped_this_arm.clear();   // 本 arm 周期各 contact.db 句柄重新各 dump 一次(首个清空文件)
+    g_prof_dumped_this_arm.clear();   // 本 arm 周期每个 contact.db 路径仅 dump 一次
     g_prof_pending = true;
-    g_any_pending.store(true, std::memory_order_release);
+    update_any_pending_locked();
     return 0;
 }
 
@@ -592,8 +654,8 @@ Java_com_chekayo_larkresign_ResignTracker_nativeProfileResult(JNIEnv*, jclass) {
     return g_prof_result;
 }
 
-// 请求一次全量花名册 dump: 记路径+置 pending, 下一次 contact.db prepare 就地把全员落 JSONL。
-// 不限 is_resigned(覆盖全员, 补齐组织巡游时无 profile 的同事姓名)。
+// 请求一次全量花名册 dump: 记路径+置 pending, 下一次 contact.db prepare 就地把全员原子落 JSONL。
+// 不限 is_resigned(覆盖全员, 补齐无 profile 的同事姓名与 chatter_type)。
 extern "C" JNIEXPORT jint JNICALL
 Java_com_chekayo_larkresign_ResignTracker_nativeArmRoster(JNIEnv* env, jclass, jstring jpath) {
     if (!jpath) return -1;
@@ -607,12 +669,10 @@ Java_com_chekayo_larkresign_ResignTracker_nativeArmRoster(JNIEnv* env, jclass, j
     g_roster_path = std::move(p);
     g_roster_target_uid = std::move(uid);
     g_roster_result = -999;
-    g_roster_rows = 0;
-    g_roster_written = 0;
     g_roster_gen++;
-    g_roster_dumped_this_arm.clear();   // 本 arm 周期各 contact.db 句柄重新各 dump 一次(首个清空文件)
+    g_roster_dumped_this_arm.clear();   // 本 arm 周期每个 contact.db 路径仅 dump 一次
     g_roster_pending = true;
-    g_any_pending.store(true, std::memory_order_release);
+    update_any_pending_locked();
     return 0;
 }
 
