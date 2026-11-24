@@ -165,10 +165,11 @@ final class RecallBubbleUi {
         boolean hintMode;
         Binding(View view, String uid, String chat, String id) { super(view); this.uid = uid; this.chat = chat; this.id = id; }
         void refresh(View view, String activeUid) {
-            // 关闭开关或切换账号立即撤下 overlay；颜色修改则复用当前 drawable 换色。
-            boolean show = Config.antirecall && Config.showRecallHint && AntiRecall.TAMPER != 2
+            // 关闭开关或切换账号立即撤下 overlay；颜色/模式/尺寸变化时复用当前 drawable 更新。
+            boolean show = Config.antirecall && Config.showRecallHint
                     && uid.equals(activeUid) && RecallMessages.marked(uid, chat, id);
             if (!show) { remove(view); return; }
+            boolean changed = false;
             if (border == null) {
                 originalBottom = view.getPaddingBottom();
                 border = new Border(view, view.getResources().getDisplayMetrics().density);
@@ -176,17 +177,40 @@ final class RecallBubbleUi {
                 description = view.getContentDescription();
                 markedDescription = (description == null ? "" : description + "，") + "已撤回，原文已保留";
                 view.setContentDescription(markedDescription);
+                changed = true;
             }
             // 提示模式给文案预留独立空间，避免覆盖正文；颜色模式恢复宿主布局。
             boolean nextHint = Config.recallDisplayMode == Config.RECALL_MODE_HINT;
             int bottom = originalBottom + (nextHint ? Math.round(22 * view.getResources().getDisplayMetrics().density) : 0);
-            if (view.getPaddingBottom() != bottom)
+            if (view.getPaddingBottom() != bottom) {
                 view.setPadding(view.getPaddingLeft(), view.getPaddingTop(), view.getPaddingRight(), bottom);
-            hintMode = nextHint;
-            border.hintMode = hintMode;
-            border.setColor(Config.recallBorderColor);
-            border.setBounds(0, 0, view.getWidth(), view.getHeight());
-            border.invalidateSelf(); // grouping can change corner radii without changing size
+                changed = true;
+            }
+            if (hintMode != nextHint) {
+                hintMode = nextHint;
+                changed = true;
+            }
+            if (border.hintMode != hintMode) {
+                border.hintMode = hintMode;
+                changed = true;
+            }
+            if (hintMode) {
+                String cfgHint = Config.recallHintText == null ? "" : Config.recallHintText;
+                if (!cfgHint.equals(border.lastConfigHint)) {
+                    border.lastConfigHint = cfgHint;
+                    changed = true;
+                }
+            }
+            if (border.setColor(Config.recallBorderColor)) {
+                changed = true;
+            }
+            int w = view.getWidth(), h = view.getHeight();
+            android.graphics.Rect bounds = border.getBounds();
+            if (bounds.left != 0 || bounds.top != 0 || bounds.right != w || bounds.bottom != h) {
+                border.setBounds(0, 0, w, h);
+                changed = true;
+            }
+            if (changed) border.invalidateSelf();
         }
         void remove(View view) {
             if (border == null) return;
@@ -219,11 +243,13 @@ final class RecallBubbleUi {
             paint.setStrokeWidth(1.5f * density);
             paint.setPathEffect(new DashPathEffect(new float[]{4 * density, 3 * density}, 0));
         }
-        void setColor(String color) {
+        boolean setColor(String color) {
             int value = android.graphics.Color.parseColor(Config.sanitizeRecallBorderColor(color));
-            if (paint.getColor() != value) { paint.setColor(value); invalidateSelf(); }
+            if (paint.getColor() != value) { paint.setColor(value); invalidateSelf(); return true; }
+            return false;
         }
         boolean hintMode;
+        String lastConfigHint;
         final android.text.TextPaint hintPaint = new android.text.TextPaint(Paint.ANTI_ALIAS_FLAG);
         String cachedHint;
         int cachedWidth = -1;

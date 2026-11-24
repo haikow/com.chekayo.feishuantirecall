@@ -33,11 +33,13 @@ import java.util.List;
  */
 public class OrgWalkerService extends AccessibilityService {
 
-    static final String PKG = "com.ss.android.lark";
-    static final String ID_TITLE = PKG + ":id/avatar_item_title";
-    static final String ID_TAIL  = PKG + ":id/avatar_item_title_tail";
-    static final String ID_CRUMB = PKG + ":id/breadcrumb_label_tv";
     static final int MAXDEPTH = 6;
+
+    // 按当前前台飞书包名动态计算控件 ID（兼容国内版 com.ss.android.lark 与国际版 com.larksuite.suite）
+    volatile String activePkg = "com.ss.android.lark";
+    volatile String idTitle = "com.ss.android.lark:id/avatar_item_title";
+    volatile String idTail  = "com.ss.android.lark:id/avatar_item_title_tail";
+    volatile String idCrumb = "com.ss.android.lark:id/breadcrumb_label_tv";
 
     // 停止/重置信号走【显式广播】: 飞书设置面板跑在飞书进程,本服务跑在模块进程(不同 UID);
     // Android 10+ 的 per-app SELinux 分类使得跨 App 读私有目录里的文件(旧的 walker_stop.flag)
@@ -47,17 +49,48 @@ public class OrgWalkerService extends AccessibilityService {
     static final String ACTION_RESET  = "com.chekayo.feishuantirecall.WALK_RESET";
 
     volatile boolean walking = false;
+    volatile boolean probing = false;
     // 暂停态(粘滞): ACTION_STOP 置位后一直为 true,不再自动巡游,直到用户点『继续巡游』(ACTION_RESUME)
     // 或『从头开始』(ACTION_RESET)。断点(visited)在暂停期间保留,继续时从断点接着走。
     volatile boolean stopReq = false;
-    long lastWalk = 0;
-    Handler bg;
+    volatile long lastWalk = 0;
+    HandlerThread ht;
+    volatile Handler bg;
+    Handler mainHandler;
+    final Object walkLock = new Object();
     final HashSet<String> visited = new HashSet<String>();
     BroadcastReceiver ctrlRx;
 
+    void updateActivePackage(CharSequence pkgCs) {
+        if (pkgCs == null) return;
+        String pkg = pkgCs.toString();
+        if (pkg.isEmpty() || pkg.equals(activePkg)) return;
+        if (pkg.indexOf("lark") < 0 && pkg.indexOf("larksuite") < 0) return;
+        activePkg = pkg;
+        idTitle = pkg + ":id/avatar_item_title";
+        idTail  = pkg + ":id/avatar_item_title_tail";
+        idCrumb = pkg + ":id/breadcrumb_label_tv";
+    }
+
+    int visitedSize() {
+        synchronized (visited) { return visited.size(); }
+    }
+
+    boolean visitedEmpty() {
+        synchronized (visited) { return visited.isEmpty(); }
+    }
+
+    void clearVisited() {
+        synchronized (visited) { visited.clear(); }
+    }
+
     @Override protected void onServiceConnected() {
         android.util.Log.i("org.walker", "=== onServiceConnected (pid=" + android.os.Process.myPid() + ") ===");
-        HandlerThread ht = new HandlerThread("org-walker");
+        mainHandler = new Handler(getMainLooper());
+        if (ht != null) {
+            try { ht.quitSafely(); } catch (Throwable ignored) {}
+        }
+        ht = new HandlerThread("org-walker");
         ht.start();
         bg = new Handler(ht.getLooper());
         registerCtrlReceiver();
@@ -73,16 +106,18 @@ public class OrgWalkerService extends AccessibilityService {
                 String a = i == null ? null : i.getAction();
                 if (ACTION_STOP.equals(a)) {
                     stopReq = true;   // 粘滞暂停: 停当前巡游 + 之后不再自动走
-                    android.util.Log.i("org.walker", "收到停止广播 -> 暂停(已完成 " + visited.size() + ")");
-                    toast(walking ? "已请求停止,走完当前部门即暂停…" : "巡游已暂停(已完成 " + visited.size() + " 个部门)");
+                    int done = visitedSize();
+                    android.util.Log.i("org.walker", "收到停止广播 -> 暂停(已完成 " + done + ")");
+                    toast(walking ? "已请求停止,走完当前部门即暂停…" : "巡游已暂停(已完成 " + done + " 个部门)");
                 } else if (ACTION_RESUME.equals(a)) {
                     stopReq = false; lastWalk = 0;   // 解除暂停 + 清冷却,回组织架构页立即从断点续跑
-                    android.util.Log.i("org.walker", "收到继续广播 -> 解除暂停(断点 " + visited.size() + ")");
-                    toast(visited.isEmpty()
+                    int done = visitedSize();
+                    android.util.Log.i("org.walker", "收到继续广播 -> 解除暂停(断点 " + done + ")");
+                    toast(done == 0
                             ? "已恢复,进【通讯录→组织内联系人】即开始巡游"
-                            : "已恢复,进【通讯录→组织内联系人】即从断点续跑(已完成 " + visited.size() + " 个部门)");
+                            : "已恢复,进【通讯录→组织内联系人】即从断点续跑(已完成 " + done + " 个部门)");
                 } else if (ACTION_RESET.equals(a)) {
-                    stopReq = false; lastWalk = 0; visited.clear();
+                    stopReq = false; lastWalk = 0; clearVisited();
                     try { new java.io.File(visitedFile()).delete(); } catch (Throwable ignored) {}
                     android.util.Log.i("org.walker", "收到重置广播 -> 清断点,可重走");
                     toast("已清除断点,进【通讯录→组织内联系人】从头开始");
@@ -98,9 +133,27 @@ public class OrgWalkerService extends AccessibilityService {
         else registerReceiver(ctrlRx, f);
     }
 
-    @Override public boolean onUnbind(Intent intent) {
+    private void cleanupService() {
+        stopReq = true;
         try { if (ctrlRx != null) { unregisterReceiver(ctrlRx); ctrlRx = null; } } catch (Throwable ignored) {}
+        Handler h = bg;
+        if (h != null) h.removeCallbacksAndMessages(null);
+        bg = null;
+        HandlerThread t = ht;
+        ht = null;
+        if (t != null) {
+            try { t.quitSafely(); } catch (Throwable ignored) {}
+        }
+    }
+
+    @Override public boolean onUnbind(Intent intent) {
+        cleanupService();
         return super.onUnbind(intent);
+    }
+
+    @Override public void onDestroy() {
+        cleanupService();
+        super.onDestroy();
     }
 
     /**
@@ -111,61 +164,126 @@ public class OrgWalkerService extends AccessibilityService {
     boolean walkerEnabled() { return true; }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {
+        if (e == null) return;
         // 只处理飞书事件(配置里 packageNames 已限,这里再保险)
-        String pkg0 = String.valueOf(e.getPackageName());
+        CharSequence pkgCs = e.getPackageName();
+        String pkg0 = pkgCs == null ? null : pkgCs.toString();
         if (pkg0 == null || (pkg0.indexOf("lark") < 0 && pkg0.indexOf("larksuite") < 0)) return;
-        if (!walkerEnabled()) return;
-        if (walking) return;
-        // 暂停态(点过停止): 一直不自动巡游,直到用户在设置里点『继续巡游』(ACTION_RESUME)。
-        // 这样才不会像以前那样"停了又在通讯录页自动重启";续跑改由显式按钮触发,清晰可控。
-        if (stopReq) return;
+        updateActivePackage(pkg0);
+        if (!walkerEnabled() || walking || probing || stopReq) return;
         if (System.currentTimeMillis() - lastWalk < 60_000) return;   // 冷却 60s
+        final Handler bgHandler = bg;
+        if (bgHandler == null) return;
 
-        // getRootInActiveWindow() 在飞书里常返回消息列表窗口(常驻),而非当前部门树页。
-        // 改为遍历所有窗口,找含部门树控件(breadcrumb_label_tv / recylerview)的那个。
-        // 页面异步加载:WINDOW_STATE_CHANGED 瞬间只渲染前几行 -> 延迟 1.5s 再扫,并重试。
-        boolean hasDept = false;
-        AccessibilityNodeInfo root = null;
-        List<Row> rows = null;
-        for (int attempt = 0; attempt < 4 && !hasDept; attempt++) {
-            if (attempt > 0) sleep(1500);   // 第一次立即扫,后续每 1.5s 重试(等渲染)
-            root = findDeptTreeRoot();
-            if (root == null) { android.util.Log.w("org.walker", "没找到部门树窗口(尝试" + attempt + ")"); continue; }
-            rows = scanRows(root);
-            android.util.Log.i("org.walker", "部门树窗口 rows=" + rows.size() + "(尝试" + attempt + ")");
+        // 主线程禁止 sleep：先做一次快速非阻塞探测；若页面尚未渲染完毕则交由 bg HandlerThread 异步重试。
+        AccessibilityNodeInfo root = findDeptTreeRoot();
+        if (root != null) {
+            List<Row> rows = scanRows(root);
+            boolean hasDept = false;
             for (Row r : rows) if (r.isDept) { hasDept = true; break; }
+            if (hasDept) {
+                startWalkOnBg(bgHandler, rows.size());
+                return;
+            }
+            // 已命中部门树窗口但暂未刷出子部门行，交给后台线程延迟重试
+            scheduleAsyncProbe(bgHandler);
+            return;
         }
-        if (root == null) return;
-        if (rows.isEmpty()) dumpIdsOnce(root);   // 控件 id 不匹配时,把当前页所有 id 抓一次
-        if (!hasDept) {
-            android.util.Log.w("org.walker", "没扫到部门行(rows=" + rows.size() + ",可能全是人或 tail 未匹配)");
-            // 兜底:只要有任意 title 行就当部门树页,开走(scanDepts 内部会滑到底重扫)
-            if (rows.isEmpty()) return;
+        if (e.getEventType() == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            scheduleAsyncProbe(bgHandler);
         }
-        // 开走
-        walking = true; lastWalk = System.currentTimeMillis();
-        stopReq = false;    // 新一轮开走: 复位停止标志
-        // 断点续跑: visited 常驻内存(服务活着就在),这里【不清空】——停止后重进组织页即接着走。
-        // 服务被系统杀/重启后由 onServiceConnected 的 loadVisited() 从模块自己的目录恢复。
-        android.util.Log.i("org.walker", ">>> 开始 DFS 巡游(部门数≈" + rows.size() + " 已完成=" + visited.size() + ")");
-        bg.post(new Runnable() { @Override public void run() {
-            try {
-                toast(visited.isEmpty() ? "开始自动归档组织通讯录…" : "续上次巡游,已完成 " + visited.size() + " 个部门…");
-                walk(new ArrayList<String>(), 0);
-                boolean stopped = stopRequested();
-                if (stopped) {
-                    saveVisited();   // 暂停: 断点存盘(也常驻内存),点『继续巡游』后从此处接着走
-                    toast("巡游已暂停,已完成 " + visited.size() + " 个部门。去设置点『继续巡游』续跑");
-                } else {
-                    // 正常完成: 全树走完,断点无用了,清掉(下次进组织页若有新部门可重走)
-                    visited.clear();
-                    try { new java.io.File(visitedFile()).delete(); } catch (Throwable ignored) {}
-                    toast("组织通讯录归档完成");
+    }
+
+    void scheduleAsyncProbe(Handler bgHandler) {
+        synchronized (walkLock) {
+            if (walking || probing || stopReq) return;
+            probing = true;
+        }
+        bgHandler.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    AccessibilityNodeInfo root = null;
+                    List<Row> rows = null;
+                    boolean hasDept = false;
+                    for (int attempt = 0; attempt < 3 && !hasDept; attempt++) {
+                        if (walking || stopReq || bg == null) return;
+                        sleep(1500);
+                        if (walking || stopReq || bg == null) return;
+                        root = findDeptTreeRoot();
+                        if (root == null) {
+                            android.util.Log.w("org.walker", "没找到部门树窗口(异步尝试" + (attempt + 1) + ")");
+                            continue;
+                        }
+                        rows = scanRows(root);
+                        android.util.Log.i("org.walker", "部门树窗口 rows=" + rows.size() + "(异步尝试" + (attempt + 1) + ")");
+                        for (Row r : rows) if (r.isDept) { hasDept = true; break; }
+                    }
+                    if (root == null || rows == null || walking || stopReq) return;
+                    if (rows.isEmpty()) {
+                        dumpIdsOnce(root);
+                        return;
+                    }
+                    if (!hasDept) {
+                        android.util.Log.w("org.walker", "没扫到部门行(rows=" + rows.size() + ",可能全是人或 tail 未匹配)");
+                    }
+                    runWalkLoop(rows.size());
+                } catch (Throwable t) {
+                    android.util.Log.e("org.walker", "异步探测异常", t);
+                } finally {
+                    probing = false;
                 }
             }
-            catch (Throwable t) { toast("巡游异常:" + t); android.util.Log.e("org.walker", "巡游异常", t); }
-            finally { walking = false; android.util.Log.i("org.walker", "<<< 巡游结束"); }
-        }});
+        });
+    }
+
+    void startWalkOnBg(Handler bgHandler, final int approxRows) {
+        synchronized (walkLock) {
+            if (walking || stopReq) return;
+            walking = true;
+            lastWalk = System.currentTimeMillis();
+            stopReq = false;
+        }
+        android.util.Log.i("org.walker", ">>> 开始 DFS 巡游(部门数≈" + approxRows + " 已完成=" + visitedSize() + ")");
+        bgHandler.post(new Runnable() {
+            @Override public void run() {
+                executeWalkBody();
+            }
+        });
+    }
+
+    void runWalkLoop(int approxRows) {
+        synchronized (walkLock) {
+            if (walking || stopReq) return;
+            walking = true;
+            lastWalk = System.currentTimeMillis();
+            stopReq = false;
+        }
+        android.util.Log.i("org.walker", ">>> 开始 DFS 巡游(部门数≈" + approxRows + " 已完成=" + visitedSize() + ")");
+        executeWalkBody();
+    }
+
+    void executeWalkBody() {
+        try {
+            int done = visitedSize();
+            toast(done == 0 ? "开始自动归档组织通讯录…" : "续上次巡游,已完成 " + done + " 个部门…");
+            walk(new ArrayList<String>(), 0);
+            boolean stopped = stopRequested();
+            if (stopped) {
+                saveVisited();   // 暂停: 断点存盘(也常驻内存),点『继续巡游』后从此处接着走
+                toast("巡游已暂停,已完成 " + visitedSize() + " 个部门。去设置点『继续巡游』续跑");
+            } else {
+                // 正常完成: 全树走完,断点无用了,清掉(下次进组织页若有新部门可重走)
+                clearVisited();
+                try { new java.io.File(visitedFile()).delete(); } catch (Throwable ignored) {}
+                toast("组织通讯录归档完成");
+            }
+        } catch (Throwable t) {
+            toast("巡游异常:" + t);
+            android.util.Log.e("org.walker", "巡游异常", t);
+        } finally {
+            walking = false;
+            android.util.Log.i("org.walker", "<<< 巡游结束");
+        }
     }
 
     @Override public void onInterrupt() {}
@@ -183,7 +301,7 @@ public class OrgWalkerService extends AccessibilityService {
         if (!walking) return false;   // 没在巡游: 放行, 音量键正常工作
         if (event.getAction() == KeyEvent.ACTION_DOWN && !stopReq) {
             stopReq = true;
-            android.util.Log.i("org.walker", "音量键 -> 暂停巡游(已完成 " + visited.size() + ")");
+            android.util.Log.i("org.walker", "音量键 -> 暂停巡游(已完成 " + visitedSize() + ")");
             toast("已用音量键停止,走完当前部门即暂停。去设置点『继续巡游』续跑");
         }
         return true;   // 巡游期间音量键全部消费(当作"停止"手势)
@@ -193,56 +311,32 @@ public class OrgWalkerService extends AccessibilityService {
      * 找部门树页的根节点。飞书消息列表是常驻窗口,getRootInActiveWindow() 常返回它
      * (而非当前看到的部门树页)。这里遍历所有窗口,找含部门树特征控件(breadcrumb_label_tv
      * 或 avatar_item_title)的那个窗口的 root。
-     * 必须在主线程调用(getWindows 要求);onAccessibilityEvent 本就在主线程。
      */
     AccessibilityNodeInfo findDeptTreeRoot() {
-        // 优先:活动窗口本身(大多数情况它就是部门页)
-        AccessibilityNodeInfo act = getRootInActiveWindow();
-        if (act != null && hasDeptTreeMarker(act)) return act;
-        // 兜底:遍历所有窗口(飞书常驻消息列表窗口会抢 active)
-        java.util.List<android.view.accessibility.AccessibilityWindowInfo> wins = getWindows();
-        if (wins != null) {
-            for (android.view.accessibility.AccessibilityWindowInfo w : wins) {
-                if (w == null) continue;
-                AccessibilityNodeInfo r = w.getRoot();
-                if (r != null && hasDeptTreeMarker(r)) return r;
+        try {
+            // 优先:活动窗口本身(大多数情况它就是部门页)
+            AccessibilityNodeInfo act = getRootInActiveWindow();
+            if (act != null && hasDeptTreeMarker(act)) return act;
+            // 兜底:遍历所有窗口(飞书常驻消息列表窗口会抢 active)
+            java.util.List<android.view.accessibility.AccessibilityWindowInfo> wins = getWindows();
+            if (wins != null) {
+                for (android.view.accessibility.AccessibilityWindowInfo w : wins) {
+                    if (w == null) continue;
+                    AccessibilityNodeInfo r = w.getRoot();
+                    if (r != null && hasDeptTreeMarker(r)) return r;
+                }
             }
-        }
+        } catch (Throwable ignored) {}
         return null;
     }
 
     /** 该 root 下是否含部门树特征控件(breadcrumb_label_tv 或 avatar_item_title)。 */
     boolean hasDeptTreeMarker(AccessibilityNodeInfo root) {
-        // findAccessibilityNodeInfosByViewId 会递归整棵子树,命中即返回,够快
-        if (!root.findAccessibilityNodeInfosByViewId(ID_CRUMB).isEmpty()) return true;
-        if (!root.findAccessibilityNodeInfosByViewId(ID_TITLE).isEmpty()) return true;
-        return false;
-    }
-
-    /** 判断当前活动窗口是否为飞书的组织架构页。
-     *  不依赖单条事件 className(异步加载时事件 cls 常是 FrameLayout):
-     *  ① 活动窗口包名是飞书; ② 页面里出现"组织内联系人/组织架构"特征文本 或 部门行。 */
-    boolean isDeptPage(AccessibilityNodeInfo root) {
         if (root == null) return false;
-        String wp = String.valueOf(root.getPackageName());
-        if (wp == null || (wp.indexOf("lark") < 0 && wp.indexOf("larksuite") < 0)) return false;
-        // 扫一遍可见文本,命中组织架构页特征即认(飞书该页标题/面包屑恒含这些词)
-        java.util.List<AccessibilityNodeInfo> q = new ArrayList<AccessibilityNodeInfo>(); q.add(root);
-        for (int i = 0; i < q.size() && i < 3000; i++) {
-            AccessibilityNodeInfo n = q.get(i);
-            if (n == null) continue;
-            CharSequence tx = n.getText();
-            if (tx != null && tx.length() > 0) {
-                String s = tx.toString();
-                // 标题/面包屑特征:"组织架构""组织内联系人""总部"(根部门);避免误命中聊天名
-                if (s.indexOf("组织架构") >= 0 || s.indexOf("组织内联系人") >= 0
-                        || s.indexOf("组织结构") >= 0) {
-                    android.util.Log.i("org.walker", "isDeptPage=true (文本命中: " + s + ")");
-                    return true;
-                }
-            }
-            for (int c = 0; c < n.getChildCount(); c++) q.add(n.getChild(c));
-        }
+        updateActivePackage(root.getPackageName());
+        // findAccessibilityNodeInfosByViewId 会递归整棵子树,命中即返回,够快
+        if (!root.findAccessibilityNodeInfosByViewId(idCrumb).isEmpty()) return true;
+        if (!root.findAccessibilityNodeInfosByViewId(idTitle).isEmpty()) return true;
         return false;
     }
 
@@ -260,25 +354,40 @@ public class OrgWalkerService extends AccessibilityService {
     }
     /** 开走前加载上次已完成的部门(中途停止后下次接着走)。 */
     void loadVisited() {
-        visited.clear();
+        List<String> loaded = new ArrayList<String>();
         try {
             java.io.File f = new java.io.File(visitedFile());
-            if (!f.exists()) return;
-            java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(
-                    new java.io.FileInputStream(f), "UTF-8"));
-            String line;
-            while ((line = br.readLine()) != null) { line = line.trim(); if (!line.isEmpty()) visited.add(line); }
-            br.close();
+            if (f.exists()) {
+                java.io.BufferedReader br = new java.io.BufferedReader(new java.io.InputStreamReader(
+                        new java.io.FileInputStream(f), "UTF-8"));
+                try {
+                    String line;
+                    while ((line = br.readLine()) != null) { line = line.trim(); if (!line.isEmpty()) loaded.add(line); }
+                } finally {
+                    br.close();
+                }
+            }
         } catch (Throwable ignored) {}
+        synchronized (visited) {
+            visited.clear();
+            visited.addAll(loaded);
+        }
     }
     /** 巡游结束(完成/停止)时保存已走完的部门。 */
     void saveVisited() {
         try {
+            StringBuilder sb = new StringBuilder();
+            synchronized (visited) {
+                for (String k : visited) sb.append(k).append('\n');
+            }
             java.io.File f = new java.io.File(visitedFile());
             java.io.FileOutputStream os = new java.io.FileOutputStream(f);
-            StringBuilder sb = new StringBuilder();
-            for (String k : visited) sb.append(k).append('\n');
-            os.write(sb.toString().getBytes("UTF-8")); os.flush(); os.close();
+            try {
+                os.write(sb.toString().getBytes("UTF-8"));
+                os.flush();
+            } finally {
+                os.close();
+            }
             f.setReadable(true, false);
         } catch (Throwable ignored) {}
     }
@@ -291,14 +400,16 @@ public class OrgWalkerService extends AccessibilityService {
         for (String name : depts) {
             if (stopRequested()) { android.util.Log.i("org.walker", "用户请求停止,退出循环 at " + name); break; }
             String key = join(path) + "/" + name;
-            if (visited.contains(key)) continue;
+            boolean already;
+            synchronized (visited) { already = visited.contains(key); }
+            if (already) continue;
             if (tapDept(name)) {
                 List<String> np = new ArrayList<String>(path); np.add(name);
                 walk(np, depth + 1);
                 // 关键: 子树【完整走完】(没被打断)才记该部门为 done。若在子树里被停止,
                 // 此处必须【不记 key】就退出——否则父部门被误标已完成,续跑会整枝跳过(接不上)。
                 if (stopRequested()) { android.util.Log.i("org.walker", "停止中: 子树未走完,不记 " + key + ",直接退出"); return; }
-                visited.add(key);
+                synchronized (visited) { visited.add(key); }
                 performGlobalAction(GLOBAL_ACTION_BACK);
                 sleep(1200);
             } else {
@@ -378,8 +489,10 @@ public class OrgWalkerService extends AccessibilityService {
     /** 解析当前页所有行:标题 + 是否部门(同 y 存在 tail)。 */
     List<Row> scanRows(AccessibilityNodeInfo root) {
         List<Row> out = new ArrayList<Row>();
-        List<AccessibilityNodeInfo> titles = root.findAccessibilityNodeInfosByViewId(ID_TITLE);
-        List<AccessibilityNodeInfo> tails  = root.findAccessibilityNodeInfosByViewId(ID_TAIL);
+        if (root == null) return out;
+        updateActivePackage(root.getPackageName());
+        List<AccessibilityNodeInfo> titles = root.findAccessibilityNodeInfosByViewId(idTitle);
+        List<AccessibilityNodeInfo> tails  = root.findAccessibilityNodeInfosByViewId(idTail);
         int[] ty = new int[tails.size()];
         for (int i = 0; i < tails.size(); i++) { android.graphics.Rect rc = new android.graphics.Rect(); tails.get(i).getBoundsInScreen(rc); ty[i] = rc.centerY(); }
         for (AccessibilityNodeInfo t : titles) {
@@ -459,7 +572,8 @@ public class OrgWalkerService extends AccessibilityService {
     static final int NOTIF_ID = 0x7717;
     void toast(final String s) {
         android.util.Log.i("org.walker", "提示: " + s);
-        new Handler(getMainLooper()).post(new Runnable() { @Override public void run() {
+        Handler mh = mainHandler != null ? mainHandler : new Handler(getMainLooper());
+        mh.post(new Runnable() { @Override public void run() {
             try { showNotif(s); } catch (Throwable e) {
                 android.util.Log.w("org.walker", "通知失败, 回退 Toast: " + e);
                 try { Toast.makeText(OrgWalkerService.this, "[组织巡游] " + s, Toast.LENGTH_SHORT).show(); }

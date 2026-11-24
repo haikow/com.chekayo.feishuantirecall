@@ -140,7 +140,6 @@ final class RecallTranslationUi {
             this.model = model; this.lookup = lookup; this.message = message;
         }
         @Override public boolean blocked(Object receiver, java.util.List<Object> args) throws Throwable {
-            if (AntiRecall.TAMPER == 2) return false;
             String uid = handlerAccounts.get(receiver), id = (String) args.get(2);
             if (uid == null) uid = RecallMessages.account();
             if (RecallMessages.markedMessage(uid, id)) return true;
@@ -203,17 +202,16 @@ final class RecallTranslationUi {
         return binding;
     }
 
-    // 与气泡共用刷新定时器：SQL 层撤回即使没触发宿主重绑，也能清除旧翻译控件。
+    // 与气泡共用刷新定时器：仅在突发窗或撤回代际变化时被唤醒，不再因普通未撤回消息无限续命。
     static boolean refresh(String uid) {
-        boolean active = false;
         for (Map.Entry<View, Binding> item : new ArrayList<Map.Entry<View, Binding>>(bindings.entrySet())) {
             View view = item.getKey();
             if (view == null || !item.getValue().visible()) continue;
             try {
-                if (!item.getValue().suppress(view, uid)) active |= Config.antirecall && AntiRecall.TAMPER != 2;
+                item.getValue().suppress(view, uid);
             } catch (Throwable ignored) {}
         }
-        return active;
+        return false;
     }
 
     static final class Binding extends RecallVisibility {
@@ -229,7 +227,7 @@ final class RecallTranslationUi {
             return false;
         }
         boolean blocked(String activeUid) {
-            return AntiRecall.TAMPER != 2 && uid.equals(activeUid) && RecallMessages.marked(uid, chat, id);
+            return uid.equals(activeUid) && RecallMessages.marked(uid, chat, id);
         }
         boolean suppress(View view, String activeUid) throws Throwable {
             // 已撤回只清翻译 UI，不遮挡消息正文/云文档/媒体本身的查看入口。

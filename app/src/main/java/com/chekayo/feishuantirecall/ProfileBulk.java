@@ -39,61 +39,90 @@ public class ProfileBulk {
 
     /** 解析 JSONL, 批量并入 profiles.json。返回本次处理的行数。 */
     public static int merge(File jsonl, File profilesJson) throws Exception {
+        return mergeInternal(jsonl, profilesJson, true, "bulk_at");
+    }
+
+    /**
+     * 解析全量花名册 JSONL(每行同 merge 的格式: {chatter_id,tenant_id,name,is_resigned,hex}),
+     * append-only 并入 profiles.json。无 hex 时仅补姓名/租户/离职态，不解 protobuf。
+     */
+    public static int mergeRoster(File jsonl, File profilesJson) throws Exception {
+        return mergeInternal(jsonl, profilesJson, false, "roster_at");
+    }
+
+    private static int mergeInternal(File jsonl, File profilesJson, boolean requireBlob, String tsField) throws Exception {
         if (!jsonl.exists()) return 0;
 
         // pass 1: 统计 tenant 分布, 人数最多者 = 本公司
         HashMap<String, Integer> tcount = new HashMap<String, Integer>();
         BufferedReader br = reader(jsonl);
-        String line;
-        while ((line = br.readLine()) != null) {
-            String t = quickField(line, "tenant_id");
-            if (t != null && !t.isEmpty()) { Integer c = tcount.get(t); tcount.put(t, c == null ? 1 : c + 1); }
+        try {
+            String line;
+            while ((line = br.readLine()) != null) {
+                String t = quickField(line, "tenant_id");
+                if (t != null && !t.isEmpty()) { Integer c = tcount.get(t); tcount.put(t, c == null ? 1 : c + 1); }
+            }
+        } finally {
+            br.close();
         }
-        br.close();
         String home = null; int best = -1;
         for (Map.Entry<String, Integer> e : tcount.entrySet()) if (e.getValue() > best) { best = e.getValue(); home = e.getKey(); }
 
-        // pass 2: 解每行 blob, 攒成 updates(不碰 profiles.json, 缩短持锁时间)
+        // pass 2: 解每行, 攒 updates(不碰 profiles.json, 缩短持锁时间)
         List<JSONObject> updates = new ArrayList<JSONObject>();
         br = reader(jsonl);
-        while ((line = br.readLine()) != null) {
-            line = line.trim();
-            if (line.isEmpty()) continue;
-            JSONObject row;
-            try { row = new JSONObject(line); } catch (Throwable t) { continue; }
-            String uid = row.optString("chatter_id", "");
-            if (uid.isEmpty()) continue;
-            byte[] blob;
-            try { blob = hex(row.optString("hex", "")); } catch (Throwable t) { continue; }
-            // 离职后宿主可能清空富资料；状态和姓名仍须更新，历史明细由 merge 保留。
-            if (blob == null) blob = new byte[0];
-            HashMap<String, String> sec = new HashMap<String, String>();
-            collectSections(blob, sec);
-            String company = companyName(blob);
+        try {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                JSONObject row;
+                try { row = new JSONObject(line); } catch (Throwable t) { continue; }
+                String uid = row.optString("chatter_id", "");
+                if (uid.isEmpty()) continue;
 
-            JSONObject u = new JSONObject();
-            u.put("id", uid);
-            u.put("name", row.optString("name", ""));
-            String tid = row.optString("tenant_id", "");
-            u.put("tenant_id", tid);
-            u.put("is_home", home != null && home.equals(tid));
-            u.put("is_resigned", "1".equals(row.optString("is_resigned", "")));
-            u.put("kind", DataViews.classifyProfile(u));
-            u.put("department",  flat(sec.get(SEC_DEPT)));
-            u.put("email",       flat(sec.get(SEC_EMAIL)));
-            u.put("employee_id", flat(sec.get(SEC_JOBNO)));
-            u.put("position",    flat(sec.get(SEC_TITLE)));
-            u.put("leader",      flat(sec.get(SEC_LEADER)));
-            u.put("phone",       flat(sec.get(SEC_PHONE)));
-            u.put("nickname",    flat(sec.get(SEC_NICK)));
-            if (company != null && !company.isEmpty()) u.put("company", company);
-            updates.add(u);
+                String hexStr = row.optString("hex", "");
+                byte[] blob = null;
+                if (!hexStr.isEmpty()) {
+                    try {
+                        blob = hex(hexStr);
+                    } catch (Throwable t) {
+                        if (requireBlob) continue;
+                        blob = null;
+                    }
+                }
+
+                JSONObject u = new JSONObject();
+                u.put("id", uid);
+                u.put("name", row.optString("name", ""));
+                String tid = row.optString("tenant_id", "");
+                u.put("tenant_id", tid);
+                u.put("is_home", home != null && home.equals(tid));
+                u.put("is_resigned", "1".equals(row.optString("is_resigned", "")));
+
+                if (blob != null && blob.length > 0) {
+                    HashMap<String, String> sec = new HashMap<String, String>();
+                    collectSections(blob, sec);
+                    String company = companyName(blob);
+                    u.put("department",  flat(sec.get(SEC_DEPT)));
+                    u.put("email",       flat(sec.get(SEC_EMAIL)));
+                    u.put("employee_id", flat(sec.get(SEC_JOBNO)));
+                    u.put("position",    flat(sec.get(SEC_TITLE)));
+                    u.put("leader",      flat(sec.get(SEC_LEADER)));
+                    u.put("phone",       flat(sec.get(SEC_PHONE)));
+                    u.put("nickname",    flat(sec.get(SEC_NICK)));
+                    if (company != null && !company.isEmpty()) u.put("company", company);
+                }
+                updates.add(u);
+            }
+        } finally {
+            br.close();
         }
-        br.close();
 
         long now = System.currentTimeMillis();
         synchronized (Config.PROFILES_LOCK) {
-            JSONObject all = profilesJson.exists() ? new JSONObject(readFile(profilesJson)) : new JSONObject();
+            JSONObject all = (profilesJson.exists() && profilesJson.length() > 0)
+                    ? new JSONObject(readFile(profilesJson)) : new JSONObject();
             for (JSONObject u : updates) {
                 String uid = u.getString("id");
                 JSONObject rec = all.optJSONObject(uid);
@@ -112,7 +141,7 @@ public class ProfileBulk {
                 putIfEmpty(rec, "phone",       u.optString("phone", ""));
                 putIfEmpty(rec, "nickname",    u.optString("nickname", ""));
                 putIfEmpty(rec, "company",     u.optString("company", ""));
-                rec.put("bulk_at", now);
+                rec.put(tsField, now);
                 all.put(uid, rec);
             }
             writeAtomic(profilesJson, all.toString(1));
@@ -130,105 +159,6 @@ public class ProfileBulk {
         String cur = o.optString(k, "");
         if (cur != null && !cur.isEmpty()) return;
         try { o.put(k, v); } catch (Throwable ignored) {}
-    }
-
-    /**
-     * 解析全量花名册 JSONL(每行同 merge 的格式: {chatter_id,tenant_id,name,is_resigned,hex}),
-     * append-only 并入 profiles.json。区别于 merge:
-     *   - 覆盖全员(不限 is_resigned), 无 hex 的人也落 name/tenant_id/is_resigned -> 全员档案 UI 能显示。
-     *   - hex 空 -> 只补 name/分类, 不解 protobuf(那些无富资料的同事至少有姓名)。
-     * tenant 分布统计与本类其它方法一致: 人数最多的 tenant = 本公司(is_home)。
-     * 返回本次处理的行数(含无 hex 的)。
-     */
-    public static int mergeRoster(File jsonl, File profilesJson) throws Exception {
-        if (!jsonl.exists()) return 0;
-
-        // pass 1: 统计 tenant 分布(用全量, 不像 merge 只看有 blob 的人), 人数最多者 = 本公司
-        HashMap<String, Integer> tcount = new HashMap<String, Integer>();
-        BufferedReader br = reader(jsonl);
-        String line;
-        while ((line = br.readLine()) != null) {
-            String t = quickField(line, "tenant_id");
-            if (t != null && !t.isEmpty()) { Integer c = tcount.get(t); tcount.put(t, c == null ? 1 : c + 1); }
-        }
-        br.close();
-        String home = null; int best = -1;
-        for (Map.Entry<String, Integer> e : tcount.entrySet()) if (e.getValue() > best) { best = e.getValue(); home = e.getKey(); }
-
-        // pass 2: 解每行, 攒 updates(不碰 profiles.json, 缩短持锁时间)
-        List<JSONObject> updates = new ArrayList<JSONObject>();
-        br = reader(jsonl);
-        while ((line = br.readLine()) != null) {
-            line = line.trim();
-            if (line.isEmpty()) continue;
-            JSONObject row;
-            try { row = new JSONObject(line); } catch (Throwable t) { continue; }
-            String uid = row.optString("chatter_id", "");
-            if (uid.isEmpty()) continue;
-
-            JSONObject u = new JSONObject();
-            u.put("id", uid);
-            u.put("name", row.optString("name", ""));
-            String tid = row.optString("tenant_id", "");
-            u.put("tenant_id", tid);
-            u.put("is_home", home != null && home.equals(tid));
-            u.put("is_resigned", "1".equals(row.optString("is_resigned", "")));
-            u.put("kind", DataViews.classifyProfile(u));
-
-            // 有 hex 才解 protobuf 明细; 无 hex 只补姓名/分类(放在 update 里, merge 时按 append-only 补)
-            String hex = row.optString("hex", "");
-            byte[] blob = null;
-            if (!hex.isEmpty()) {
-                try { blob = hex(hex); } catch (Throwable t) { blob = null; }
-            }
-            if (blob != null && blob.length > 0) {
-                HashMap<String, String> sec = new HashMap<String, String>();
-                collectSections(blob, sec);
-                String company = companyName(blob);
-                u.put("department",  flat(sec.get(SEC_DEPT)));
-                u.put("email",       flat(sec.get(SEC_EMAIL)));
-                u.put("employee_id", flat(sec.get(SEC_JOBNO)));
-                u.put("position",    flat(sec.get(SEC_TITLE)));
-                u.put("leader",      flat(sec.get(SEC_LEADER)));
-                u.put("phone",       flat(sec.get(SEC_PHONE)));
-                u.put("nickname",    flat(sec.get(SEC_NICK)));
-                if (company != null && !company.isEmpty()) u.put("company", company);
-            }
-            updates.add(u);
-        }
-        br.close();
-
-        long now = System.currentTimeMillis();
-        synchronized (Config.PROFILES_LOCK) {
-            JSONObject all = profilesJson.exists() ? new JSONObject(readFile(profilesJson)) : new JSONObject();
-            for (JSONObject u : updates) {
-                String uid = u.getString("id");
-                JSONObject rec = all.optJSONObject(uid);
-                if (rec == null) rec = new JSONObject();
-                rec.put("id", uid);
-                // 刷新: 名字/租户/分类/离职态/时间(姓名对"全员档案"最重要, 每次以最新为准)
-                if (u.optString("name", "").length() > 0) rec.put("name", u.getString("name"));
-                if (u.optString("tenant_id", "").length() > 0) { rec.put("tenant_id", u.getString("tenant_id")); rec.put("is_home", u.optBoolean("is_home")); }
-                rec.put("is_resigned", u.optBoolean("is_resigned"));
-                // append-only: 明细字段只补空, 不覆盖已有非空(离职清空后旧值得以保留)
-                putIfEmpty(rec, "department",  u.optString("department", ""));
-                putIfEmpty(rec, "email",       u.optString("email", ""));
-                putIfEmpty(rec, "employee_id", u.optString("employee_id", ""));
-                putIfEmpty(rec, "position",    u.optString("position", ""));
-                putIfEmpty(rec, "leader",      u.optString("leader", ""));
-                putIfEmpty(rec, "phone",       u.optString("phone", ""));
-                putIfEmpty(rec, "nickname",    u.optString("nickname", ""));
-                putIfEmpty(rec, "company",     u.optString("company", ""));
-                rec.put("roster_at", now);
-                all.put(uid, rec);
-            }
-            writeAtomic(profilesJson, all.toString(1));
-            ResignedArchive.update(profilesJson, all);
-        }
-        // 归档后推副本到模块进程，桌面「同事记录」才能读到
-        ArchiveSync.pushProfiles();
-        ArchiveSync.pushResigned();
-        return updates.size();
     }
 
     // ── protobuf wire-format(仅需的部分) ─────────────────────────────

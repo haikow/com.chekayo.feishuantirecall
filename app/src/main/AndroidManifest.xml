@@ -4,8 +4,9 @@
     android:versionCode="36"
     android:versionName="1.8.14">
 
-    <uses-sdk android:minSdkVersion="22" android:targetSdkVersion="34" />
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <queries>
         <package android:name="com.chekayo.feishuantirecall" />
@@ -20,7 +21,7 @@
         android:icon="@drawable/module_logo">
 
         <meta-data android:name="xposedmodule" android:value="true" />
-        <meta-data android:name="xposeddescription" android:value="FeishuKit：防撤回 / 防已读 / 离职档案。设置在飞书「设置 → 实验室」后的「模块设置」" />
+        <meta-data android:name="xposeddescription" android:value="FeishuKit：防撤回 / 防已读 / 离职档案。设置在飞书「设置 → 模块设置」或桌面图标" />
         <meta-data android:name="xposedminversion" android:value="82" />
         <meta-data android:name="xposedscope" android:resource="@array/xposedscope" />
 

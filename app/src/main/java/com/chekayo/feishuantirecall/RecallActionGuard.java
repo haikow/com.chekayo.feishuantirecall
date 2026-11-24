@@ -60,7 +60,7 @@ final class RecallActionGuard {
 
     static boolean blockedMessage(Object message) {
         // 优先使用模型里的 chatId，避免不同会话里相同 ID 或切号后误判。
-        if (message == null || AntiRecall.TAMPER == 2) return false;
+        if (message == null) return false;
         try {
             return RecallMessages.marked(RecallMessages.account(),
                     RecallMessages.messageText(message, "getChatId", ""),
@@ -69,7 +69,6 @@ final class RecallActionGuard {
     }
     static boolean blockedId(String id, String chat) {
         // 仅当宿主没有提供模型/会话时才使用消息 ID 的账号级索引兜底。
-        if (AntiRecall.TAMPER == 2) return false;
         String uid = RecallMessages.account();
         return RecallMessages.marked(uid, chat, id) || RecallMessages.markedMessage(uid, id);
     }

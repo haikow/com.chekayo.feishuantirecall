@@ -36,21 +36,9 @@ public class NotifArchive {
     // 近期消息缓冲(内存, 不落盘)
     static final int BUF = 80;
     static final long BUF_WINDOW = 10 * 60 * 1000L;   // 10 分钟
-    /** 还原表时效: 只认 30 分钟内的条目, 防止旧存档原文被当成新撤回的消息显示。 */
-    static final long RESTORE_WINDOW_MS = 30 * 60 * 1000L;
     static final java.util.ArrayList<String[]> recent = new java.util.ArrayList<String[]>();  // {timeMs, sender, body}
     static volatile String lastSaved = "";
     static volatile long   lastSavedTime = 0;
-
-    // 撤回原文还原表: sender -> {body, time}；聊天 UI 严格按发送人匹配
-    static final int RESTORE_MAX = 50;
-    static final java.util.LinkedHashMap<String, String[]> restoreMap =
-            new java.util.LinkedHashMap<String, String[]>(32, 0.75f, true) {
-                @Override protected boolean removeEldestEntry(java.util.Map.Entry<String, String[]> e) {
-                    return size() > RESTORE_MAX;
-                }
-            };
-    static volatile boolean restoredFromFile = false;
 
     // 开关热读节流
     static volatile long lastCfgReload = 0;
@@ -68,7 +56,6 @@ public class NotifArchive {
         if (uid == null || uid.isEmpty()) uid = AccountPaths.FALLBACK_UID;
         File acc = new File(filesDir, "accounts/" + AccountPaths.safeUid(uid));
         FILE = new File(acc, "notif_archive.txt");
-        restoredFromFile = false;
         try { android.util.Log.i("fucklark", "NotifArchive FILE=" + FILE); } catch (Throwable ignored) {}
     }
 
@@ -117,7 +104,7 @@ public class NotifArchive {
             String body = text.replace('\t', ' ').replace('\n', ' ').trim();
             if (body.isEmpty()) return;
 
-            // ① 撤回通知 → 回捞该发送人最近一条，落盘 + 进还原表（统计与聊天还原共用）
+            // ① 撤回通知 → 回捞该发送人最近一条，落盘存档
             String rs = recallSender(body);
             if (rs != null) {
                 String[] hit = takeRecent(rs, now);
@@ -125,8 +112,9 @@ public class NotifArchive {
                     String sig = hit[0] + "|" + hit[1];
                     if (sig.equals(lastSaved) && (now - lastSavedTime) < 8000) return;
                     lastSaved = sig; lastSavedTime = now;
-                    write(TS.format(new Date(now)) + "\t" + hit[0] + "\t" + hit[1] + "\n");
-                    putRestore(hit[0], hit[1], now);
+                    String ts;
+                    synchronized (TS) { ts = TS.format(new Date(now)); }
+                    write(ts + "\t" + hit[0] + "\t" + hit[1] + "\n");
                 }
                 return;
             }
@@ -140,89 +128,6 @@ public class NotifArchive {
             }
             if (msg.isEmpty()) return;
             addRecent(now, sender, msg);
-        } catch (Throwable ignored) {}
-    }
-
-    static synchronized void putRestore(String sender, String body, long timeMs) {
-        if (sender == null || sender.trim().isEmpty() || body == null || body.isEmpty()) return;
-        restoreMap.put(sender.trim(), new String[]{ body, Long.toString(timeMs) });
-    }
-
-    /**
-     * 按发送人查可还原的撤回原文（严格匹配 + 30 分钟时效）。
-     * sender 为空或对不上 → null，禁止用「存档里最近一条」去顶提示/还原。
-     * 时效: 还原表条目只在 RESTORE_WINDOW_MS 内有效 —— 前台聊天里的撤回不产生通知、
-     * 不会写入还原表, 若无时效会命中该发送人更早的存档原文, 把旧消息当成本次撤回原文显示。
-     */
-    public static synchronized String findRestore(String sender) {
-        return findRestore(sender, System.currentTimeMillis());
-    }
-
-    public static synchronized String findRestore(String sender, long nowMs) {
-        try {
-            if (!restoredFromFile) loadRestoreFromArchive();
-            if (sender == null || sender.trim().isEmpty()) return null;
-            String[] hit = restoreMap.get(sender.trim());
-            if (hit != null && hit.length >= 2 && hit[0] != null && !hit[0].isEmpty()) {
-                long ts = parseRestoreTs(hit[1]);
-                if (ts > 0) {
-                    long age = nowMs - ts;
-                    if (age <= RESTORE_WINDOW_MS && age >= -60000L) return hit[0];
-                }
-            }
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    /** 还原条目时间戳: 兼容 毫秒 / "yyyy-MM-dd HH:mm:ss" / "MM-dd HH:mm:ss"(补当前年)。解析不了返回 0。 */
-    static long parseRestoreTs(String s) {
-        if (s == null) return 0;
-        String t = s.trim();
-        try { return Long.parseLong(t); } catch (Throwable ignored) {}
-        try {
-            SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
-            f.setLenient(false);
-            java.util.Date d = f.parse(t, new java.text.ParsePosition(0));
-            if (d != null) return d.getTime();
-        } catch (Throwable ignored) {}
-        try {
-            synchronized (TS) {
-                java.util.Date d = TS.parse(t, new java.text.ParsePosition(0));
-                if (d != null) {
-                    java.util.Calendar c = java.util.Calendar.getInstance();
-                    c.setTime(d);
-                    c.set(java.util.Calendar.YEAR, java.util.Calendar.getInstance().get(java.util.Calendar.YEAR));
-                    long ms = c.getTimeInMillis();
-                    if (ms > System.currentTimeMillis() + 2L * 86400000L) ms -= 365L * 86400000L;  // 跨年存档回退一年
-                    return ms;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return 0;
-    }
-
-    /** 首次查还原时，从存档文件回灌最近记录（进程重启后仍可还原）。 */
-    static void loadRestoreFromArchive() {
-        restoredFromFile = true;
-        try {
-            File f = resolveArchiveFile();
-            if (f == null || !f.exists()) return;
-            String all = new String(readBytes(f), "UTF-8");
-            if (all.isEmpty()) return;
-            String[] lines = all.split("\n");
-            int start = Math.max(0, lines.length - RESTORE_MAX);
-            for (int i = start; i < lines.length; i++) {
-                String ln = lines[i];
-                if (ln == null || ln.isEmpty()) continue;
-                String[] p = ln.split("\t", 3);
-                if (p.length < 3) continue;
-                String sender = p[1].trim();
-                String body = p[2].trim();
-                long ms = parseRestoreTs(p[0]);
-                if (!sender.isEmpty() && !body.isEmpty() && ms > 0) {
-                    restoreMap.put(sender, new String[]{ body, Long.toString(ms) });
-                }
-            }
         } catch (Throwable ignored) {}
     }
 
@@ -296,14 +201,18 @@ public class NotifArchive {
         try {
             if (FILE == null || !FILE.exists()) return;
             byte[] all = readBytes(FILE);
-            int keep = all.length / 2;
-            byte[] tailB = new byte[keep];
-            System.arraycopy(all, all.length - keep, tailB, 0, keep);
+            int start = all.length / 2;
+            while (start < all.length && all[start] != '\n') start++;
+            if (start < all.length) start++; // 跳过 '\n'，从完整 UTF-8 行首开始切片
+            int keep = all.length - start;
             FileOutputStream os = new FileOutputStream(FILE, false);
-            os.write("...(旧存档已截断)...\n".getBytes("UTF-8"));
-            os.write(tailB);
-            os.flush();
-            os.close();
+            try {
+                os.write("...(旧存档已截断)...\n".getBytes("UTF-8"));
+                if (keep > 0) os.write(all, start, keep);
+                os.flush();
+            } finally {
+                os.close();
+            }
         } catch (Throwable ignored) {}
     }
 
@@ -331,10 +240,6 @@ public class NotifArchive {
         try {
             File f = resolveArchiveFile();
             if (f != null && f.exists()) f.delete();
-        } catch (Throwable ignored) {}
-        try {
-            restoreMap.clear();
-            restoredFromFile = false;
         } catch (Throwable ignored) {}
     }
 

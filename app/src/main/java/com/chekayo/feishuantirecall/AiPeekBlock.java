@@ -4,9 +4,11 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.TextView;
 
-import de.robv.android.xposed.XC_MethodHook;
+import java.util.Collections;
+import java.util.Map;
+import java.util.WeakHashMap;
+
 import de.robv.android.xposed.XposedBridge;
-import de.robv.android.xposed.XposedHelpers;
 
 /**
  * 屏蔽会话内 AI 总结「消息速览」浮层（整条，含边框）。
@@ -20,10 +22,10 @@ import de.robv.android.xposed.XposedHelpers;
  *   - 设置项「屏蔽消息速览」「显示 AI 速览」
  *
  * 【实现】锚点：文案以「消息速览」开头（不靠类名，ShineTextView 在搜索 AI 卡片里也用）。
- * 两层拦截：
- *   1) ViewGroup.addView    —— 仅拦已确认含「消息速览」文案的节点（addView 时已有文案才拦）
- *   2) View.setVisibility   —— 对已被 hideTipShell 标记的节点强制 GONE
- *   3) TextView.setText     —— 文案命中「消息速览」后清字 + 向上收壳（主路径）
+ * 统一接入 ViewHookHub（零独立全局 Hook）：
+ *   1) AddViewListener       —— 仅拦已确认含「消息速览」文案的节点
+ *   2) SetVisibilityListener —— 对已被 hideTipShell 标记的节点强制 GONE；关开关时恢复尺寸
+ *   3) SetTextListener       —— 文案命中「消息速览」后清字 + 向上收壳（主路径）
  *
  * 开关：Config.blockaipeek（默认开），设置面板「屏蔽消息速览」。
  */
@@ -33,9 +35,20 @@ public final class AiPeekBlock {
     /** setTag 键：已屏蔽过的节点，避免 setVisibility 反复重拦刷日志。 */
     static final int TAG_BLOCKED = 0x70e0b10c;
 
-    static final java.util.Set<TextView> BUSY = java.util.Collections.synchronizedSet(
-            java.util.Collections.newSetFromMap(new java.util.WeakHashMap<TextView, Boolean>()));
+    static final java.util.Set<TextView> BUSY = Collections.synchronizedSet(
+            Collections.newSetFromMap(new WeakHashMap<TextView, Boolean>()));
+    private static final Map<View, int[]> SAVED_LP =
+            Collections.synchronizedMap(new WeakHashMap<View, int[]>());
+    private static final View.OnAttachStateChangeListener DETACH_RESTORE =
+            new View.OnAttachStateChangeListener() {
+                @Override public void onViewAttachedToWindow(View v) {}
+                @Override public void onViewDetachedFromWindow(View v) {
+                    restoreView(v);
+                    try { v.removeOnAttachStateChangeListener(this); } catch (Throwable ignored) {}
+                }
+            };
 
+    private static volatile boolean installed = false;
     static volatile long lastHitLogAt = 0;
     static volatile int hitCount = 0;
 
@@ -50,100 +63,61 @@ public final class AiPeekBlock {
         } catch (Throwable ignored) {}
     }
 
-    public static void install() {
+    public static synchronized void install() {
+        if (installed) return;
+        installed = true;
+
         // ① addView：速览浮层挂树前拦掉
-        try {
-            XC_MethodHook addHook = new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) {
-                    try {
-                        if (!Config.blockaipeek) return;
-                        if (p.args == null || !(p.args[0] instanceof View)) return;
-                        View child = (View) p.args[0];
-                        // 只拦确认是速览节点本身（含 peek 类名/文案）；shell 隐藏由 setText→hideTipShell 负责
-                        if (isPeekNode(child)) {
-                            BlockLog.record("消息速览", child, "挂载拦截");
-                            markBlocked(child);
-                            hit("addView", "拦下浮层 class=" + child.getClass().getName());
-                            p.setResult(null);
-                        }
-                    } catch (Throwable ignored) {}
+        ViewHookHub.addAddViewListener(new ViewHookHub.AddViewListener() {
+            @Override public boolean beforeAddView(ViewGroup parent, View child) {
+                if (!Config.blockaipeek) return false;
+                if (isPeekNode(child)) {
+                    BlockLog.record("消息速览", child, "挂载拦截");
+                    markBlocked(child);
+                    hit("addView", "拦下浮层 class=" + child.getClass().getName());
+                    return true;
                 }
-            };
-            try { XposedHelpers.findAndHookMethod(ViewGroup.class, "addView", View.class, addHook); } catch (Throwable ignored) {}
-            try { XposedHelpers.findAndHookMethod(ViewGroup.class, "addView", View.class, int.class, addHook); } catch (Throwable ignored) {}
-            try { XposedHelpers.findAndHookMethod(ViewGroup.class, "addView", View.class, ViewGroup.LayoutParams.class, addHook); } catch (Throwable ignored) {}
-            try { XposedHelpers.findAndHookMethod(ViewGroup.class, "addView", View.class, int.class, ViewGroup.LayoutParams.class, addHook); } catch (Throwable ignored) {}
-            XposedBridge.log("[fucklark] 消息速览屏蔽: ViewGroup.addView 已 hook (进程 "
-                    + AntiRecall.currentProcessName() + ")");
-        } catch (Throwable t) {
-            XposedBridge.log("[fucklark] peek addView hook failed: " + t);
-        }
+                return false;
+            }
+            @Override public void afterAddView(ViewGroup parent, View child) {}
+        });
 
         // ② setVisibility：仅速览节点/小壳 → GONE（大容器即使含速览也不动）
-        try {
-            XposedHelpers.findAndHookMethod(View.class, "setVisibility", int.class, new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam p) {
-                    try {
-                        if (!Config.blockaipeek) return;
-                        int vis = (Integer) p.args[0];
-                        if (vis != View.VISIBLE) return;
-                        View v = (View) p.thisObject;
-                        // 仅拦已被 hideTipShell 标记的节点（由 setText 文案命中后标记）
-                        boolean block = isBlocked(v);
-                        if (!block) return;
-                        markBlocked(v);
-                        hit("setVisibility", "强制GONE class=" + v.getClass().getName());
-                        p.args[0] = View.GONE;
-                    } catch (Throwable ignored) {}
+        ViewHookHub.addSetVisibilityListener(new ViewHookHub.SetVisibilityListener() {
+            @Override public int beforeSetVisibility(View v, int visibility) {
+                if (!Config.blockaipeek) {
+                    if (isBlocked(v)) restoreView(v);
+                    return visibility;
                 }
-            });
-            XposedBridge.log("[fucklark] 消息速览屏蔽: View.setVisibility 已 hook (进程 "
-                    + AntiRecall.currentProcessName() + ")");
-        } catch (Throwable t) {
-            XposedBridge.log("[fucklark] peek setVis hook failed: " + t);
-        }
+                if (visibility != View.VISIBLE) return visibility;
+                if (!isBlocked(v)) return visibility;
+                hit("setVisibility", "强制GONE class=" + v.getClass().getName());
+                return View.GONE;
+            }
+        });
 
         // ③ setText：命中则清字 + 收壳（解决空框）
-        try {
-            XC_MethodHook h = new XC_MethodHook() {
-                @Override protected void afterHookedMethod(MethodHookParam p) {
-                    try {
-                        if (!Config.blockaipeek) return;
-                        CharSequence src = null;
-                        if (p.args != null && p.args.length > 0 && p.args[0] instanceof CharSequence) {
-                            src = (CharSequence) p.args[0];
-                        }
-                        if (src == null) return;
-                        String s = src.toString();
-                        if (!isPeekText(s)) return;
-                        TextView tv = (TextView) p.thisObject;
-                        if (BUSY.contains(tv)) return;
-                        BUSY.add(tv);
-                        try {
-                            String brief = s.trim();
-                            if (brief.length() > 24) brief = brief.substring(0, 24);
-                            hit("setText", "文案=" + brief + " class=" + tv.getClass().getName());
-                            BlockLog.record("消息速览", tv, "文案拦截", s);
-                            hideTipShell(tv);
-                        } finally {
-                            BUSY.remove(tv);
-                        }
-                    } catch (Throwable ignored) {}
+        ViewHookHub.addSetTextListener(new ViewHookHub.SetTextListener() {
+            @Override public void afterSetText(TextView tv, CharSequence src) {
+                if (!Config.blockaipeek || src == null) return;
+                String s = src.toString();
+                if (!isPeekText(s)) return;
+                if (BUSY.contains(tv)) return;
+                BUSY.add(tv);
+                try {
+                    String brief = s.trim();
+                    if (brief.length() > 24) brief = brief.substring(0, 24);
+                    hit("setText", "文案=" + brief + " class=" + tv.getClass().getName());
+                    BlockLog.record("消息速览", tv, "文案拦截", s);
+                    hideTipShell(tv);
+                } finally {
+                    BUSY.remove(tv);
                 }
-            };
-            try {
-                XposedHelpers.findAndHookMethod(TextView.class, "setText",
-                        CharSequence.class, TextView.BufferType.class, h);
-            } catch (Throwable ignored) {}
-            try {
-                XposedHelpers.findAndHookMethod(TextView.class, "setText",
-                        CharSequence.class, h);
-            } catch (Throwable ignored) {}
-            XposedBridge.log("[fucklark] 消息速览屏蔽: TextView.setText 已 hook (进程 "
-                    + AntiRecall.currentProcessName() + ")");
-        } catch (Throwable t) {
-            XposedBridge.log("[fucklark] peek setText hook failed: " + t);
-        }
+            }
+        });
+
+        XposedBridge.log("[fucklark] 消息速览屏蔽: 已注册到 ViewHookHub (进程 "
+                + AntiRecall.currentProcessName() + ")");
     }
 
     /** 文案锚点：以「消息速览」开头。不含「屏蔽消息速览」「显示 AI 速览」「N 条新消息」。 */
@@ -156,16 +130,7 @@ public final class AiPeekBlock {
         return boundary == ':' || boundary == '：' || Character.isWhitespace(boundary);
     }
 
-    /**
-     * 类名锚点：已确认 ShineTextView 同时用于搜索 AI 卡片（AIRoundViewImpl2），
-     * 不能作为全局拦截依据；.cot. 包亦同理。
-     * 所有拦截均改为文案锚点（isPeekText），此方法保留但始终返回 false。
-     */
-    static boolean isPeekClass(View v) {
-        return false;
-    }
-
-    /** 是否速览节点本身（文案或类名命中），不含「大树里夹带」。 */
+    /** 是否速览节点本身（文案命中），不含「大树里夹带」。 */
     static boolean isPeekNode(View v) {
         if (v == null) return false;
         try {
@@ -173,25 +138,10 @@ public final class AiPeekBlock {
                 CharSequence cs = ((TextView) v).getText();
                 if (cs != null && isPeekText(cs.toString())) return true;
             }
-            return isPeekClass(v);
+            return false;
         } catch (Throwable t) {
             return false;
         }
-    }
-
-    static boolean subtreeHasPeekText(View v, int depth) {
-        if (v == null || depth > 4) return false;
-        try {
-            if (isPeekNode(v)) return true;
-            if (v instanceof ViewGroup) {
-                ViewGroup vg = (ViewGroup) v;
-                int n = Math.min(vg.getChildCount(), 16);
-                for (int i = 0; i < n; i++) {
-                    if (subtreeHasPeekText(vg.getChildAt(i), depth + 1)) return true;
-                }
-            }
-        } catch (Throwable ignored) {}
-        return false;
     }
 
     /**
@@ -224,12 +174,32 @@ public final class AiPeekBlock {
         try { v.setVisibility(View.GONE); } catch (Throwable ignored) {}
         try {
             ViewGroup.LayoutParams lp = v.getLayoutParams();
-            if (lp != null) {
+            if (lp != null && (lp.width != 0 || lp.height != 0)) {
+                if (!SAVED_LP.containsKey(v)) {
+                    SAVED_LP.put(v, new int[]{ lp.width, lp.height });
+                    v.addOnAttachStateChangeListener(DETACH_RESTORE);
+                }
                 lp.height = 0;
                 lp.width = 0;
                 v.setLayoutParams(lp);
             }
         } catch (Throwable ignored) {}
+    }
+
+    static void restoreView(View v) {
+        if (v == null) return;
+        try { v.setTag(TAG_BLOCKED, null); } catch (Throwable ignored) {}
+        int[] orig = SAVED_LP.remove(v);
+        if (orig != null) {
+            try {
+                ViewGroup.LayoutParams lp = v.getLayoutParams();
+                if (lp != null && lp.width == 0 && lp.height == 0) {
+                    lp.width = orig[0];
+                    lp.height = orig[1];
+                    v.setLayoutParams(lp);
+                }
+            } catch (Throwable ignored) {}
+        }
     }
 
     static void markBlocked(View v) {
