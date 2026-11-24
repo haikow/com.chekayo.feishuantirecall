@@ -104,6 +104,20 @@ public final class AccountPaths {
         return new File(accountRoot(ctx, pkg, uid), "resign_tracker");
     }
 
+    private static java.util.List<String> candidatePackages(String pkg) {
+        java.util.LinkedHashSet<String> pkgs = new java.util.LinkedHashSet<String>();
+        if (pkg != null && !pkg.isEmpty()) pkgs.add(pkg);
+        if (currentPkg != null && !currentPkg.isEmpty()) pkgs.add(currentPkg);
+        try {
+            pkgs.addAll(Config.knownHostPackages());
+        } catch (Throwable ignored) {
+            pkgs.add("com.ss.android.lark");
+            pkgs.add("com.larksuite.suite");
+        }
+        pkgs.add(Config.MODULE_PKG);
+        return new java.util.ArrayList<String>(pkgs);
+    }
+
     /**
      * 解析档案文件（读优先级）：
      * 1) 飞书 files/accounts/&lt;uid&gt;/resign_tracker/&lt;name&gt;
@@ -111,7 +125,7 @@ public final class AccountPaths {
      * 3) 旧全局路径（兼容历史数据）
      */
     public static File resolveArchive(Context ctx, String pkg, String uid, String name) {
-        String[] pkgs = { pkg, "com.ss.android.lark", "com.larksuite.suite", "com.chekayo.feishuantirecall" };
+        java.util.List<String> pkgs = candidatePackages(pkg);
         String[] uids = { uid, currentUid, FALLBACK_UID };
         for (String p : pkgs) {
             if (p == null || p.isEmpty()) continue;
@@ -257,7 +271,7 @@ public final class AccountPaths {
 
     /** 消息类文件（通知存档/退群日志等）按账号路径。 */
     public static File resolveMessageFile(Context ctx, String pkg, String uid, String fileName) {
-        String[] pkgs = { pkg, "com.ss.android.lark", "com.larksuite.suite", "com.chekayo.feishuantirecall" };
+        java.util.List<String> pkgs = candidatePackages(pkg);
         String[] uids = { uid, currentUid, FALLBACK_UID };
         for (String p : pkgs) {
             if (p == null || p.isEmpty()) continue;

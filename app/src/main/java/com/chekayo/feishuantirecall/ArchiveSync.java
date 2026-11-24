@@ -3,22 +3,34 @@ package com.chekayo.feishuantirecall;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
+import android.net.Uri;
 import android.os.Bundle;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
-import java.io.FileOutputStream;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.UUID;
+import java.util.zip.GZIPOutputStream;
 
 /**
- * 同事档案副本同步：飞书进程归档写完后，把 profiles.json / resigned_all.json
- * 经显式包名广播推到模块进程（Android 11+ 包可见性下 ContentResolver.call 会报 Unknown authority）。
- * 模块侧 manifest 注册接收器，写入 files/resign_tracker/，桌面入口读副本。
+ * 同事档案副本同步：飞书进程归档写完后，把 profiles.json / resigned_all.json / notif_archive.txt
+ * 优先经 ContentProvider FD 流式（gzip 压缩 + commitFile）推送到模块目录（规避 Binder 1MB 上限）；
+ * 仅对 <= 200KB 的小文件保留 putFile / 显式包名广播兜底。
  */
 public final class ArchiveSync {
     public static final String ACTION_PUSH = "com.chekayo.feishuantirecall.ARCHIVE_PUSH";
     /** 模块 → 飞书：请把档案/离职名单推过来（模块进程活着时才收得到 PUSH）。 */
     public static final String ACTION_PULL = "com.chekayo.feishuantirecall.ARCHIVE_PULL";
     public static final String ACTION_REFRESH = "com.chekayo.feishuantirecall.ARCHIVE_REFRESH";
+
+    private static final long MAX_ARCHIVE_BYTES = 16L * 1024L * 1024L;
+    private static final int SMALL_FALLBACK_LIMIT = 200 * 1024;
+    private static final int MAX_BROADCAST_RECV_BYTES = 256 * 1024;
+    private static final int STREAM_BUF_SIZE = 32 * 1024;
+
     private ArchiveSync() { }
 
     public static void requestRefresh(Context ctx) {
@@ -26,8 +38,12 @@ public final class ArchiveSync {
         if (!Config.MODULE_PKG.equals(ctx.getPackageName())) {
             com.chekayo.larkresign.ResignTracker.requestRefresh("打开离职名单");
         } else {
-            for (String pkg : new String[]{ "com.ss.android.lark", "com.larksuite.suite" }) {
-                Intent i = new Intent(ACTION_REFRESH); i.setPackage(pkg); ctx.sendBroadcast(i);
+            for (String pkg : Config.knownHostPackages()) {
+                try {
+                    Intent i = new Intent(ACTION_REFRESH);
+                    i.setPackage(pkg);
+                    ctx.sendBroadcast(i);
+                } catch (Throwable ignored) { }
             }
         }
         requestPull(ctx);
@@ -38,19 +54,20 @@ public final class ArchiveSync {
         try {
             Context c = ctx != null ? ctx.getApplicationContext() : Config.appContextForSync();
             if (c == null) return;
-            Intent i = new Intent(ACTION_PULL);
-            i.setPackage("com.ss.android.lark");
-            c.sendBroadcast(i);
-            Intent i2 = new Intent(ACTION_PULL);
-            i2.setPackage("com.larksuite.suite");
-            c.sendBroadcast(i2);
+            for (String pkg : Config.knownHostPackages()) {
+                try {
+                    Intent i = new Intent(ACTION_PULL);
+                    i.setPackage(pkg);
+                    c.sendBroadcast(i);
+                } catch (Throwable ignored) { }
+            }
         } catch (Throwable ignored) { }
     }
 
     /** 将飞书侧档案文件推送到模块副本目录。name 仅接受 *.json / *.txt。 */
     public static void pushToModule(String name) {
         try {
-            if (name == null || !(name.endsWith(".json") || name.endsWith(".txt"))) return;
+            if (name == null || !name.matches("[A-Za-z0-9_]+\\.(json|txt)")) return;
             Context c = Config.appContextForSync();
             if (c == null) { Diag.w("档案同步: Application 未就绪 " + name); return; }
             String uid = AccountPaths.currentUid;
@@ -62,10 +79,25 @@ public final class ArchiveSync {
             String relative = name.endsWith(".json") ? "resign_tracker/" + name : name;
             File scoped = new File(c.getFilesDir(), "accounts/" + AccountPaths.safeUid(uid) + "/" + relative);
             if (!f.equals(scoped)) uid = null; // 旧全局数据没有可靠账号归属。
-            if (f.length() > 8L * 1024 * 1024) return;
+            long fileLen = f.length();
+            if (fileLen > MAX_ARCHIVE_BYTES) {
+                Diag.w("档案同步: 文件超过 16MB 上限，跳过 " + name + " bytes=" + fileLen);
+                return;
+            }
+
+            // 1) 主路径：FD 流式（gzip 压缩写入 staging 文件，再 commitFile 原子落盘），不走 Binder 字节数组
+            if (pushViaProviderStream(c, f, uid, name)) {
+                return;
+            }
+
+            // 2) 回落路径：仅 <= 200KB 小文件尝试 putFile 或显式广播，避免 TransactionTooLargeException
+            if (fileLen > SMALL_FALLBACK_LIMIT) {
+                Diag.w("档案同步: Provider 流式通道不可用且文件超过 200KB，跳过广播 " + name + " bytes=" + fileLen);
+                return;
+            }
             byte[] data = Config.readBytes(f);
-            if (data == null || data.length == 0) {
-                Diag.w("档案同步: 读取源文件失败 " + name + " length=" + f.length());
+            if (data == null || data.length == 0 || data.length > SMALL_FALLBACK_LIMIT) {
+                Diag.w("档案同步: 读取源文件失败或超限 " + name + " length=" + fileLen);
                 return;
             }
             try {
@@ -74,10 +106,12 @@ public final class ArchiveSync {
                 extras.putString("uid", uid);
                 Bundle result = c.getContentResolver().call(ConfigProvider.URI, "putFile", name, extras);
                 if (result != null && result.getBoolean("ok")) {
-                    Diag.w("档案同步: 已确认 " + name + " bytes=" + data.length + " scoped=" + (uid != null));
+                    Diag.w("档案同步: putFile 已确认 " + name + " bytes=" + data.length + " scoped=" + (uid != null));
                     return;
                 }
-            } catch (Throwable t) { android.util.Log.w("fucklark", "档案 Provider 推送失败，回落广播", t); }
+            } catch (Throwable t) {
+                android.util.Log.w("fucklark", "档案 Provider putFile 失败，回落广播", t);
+            }
             Intent i = new Intent(ACTION_PUSH);
             i.setComponent(new android.content.ComponentName(Config.MODULE_PKG,
                     "com.chekayo.feishuantirecall.ArchiveSync$Receiver"));
@@ -85,8 +119,50 @@ public final class ArchiveSync {
             i.putExtra("data", data);
             i.putExtra("uid", uid);
             c.sendBroadcast(i);
-            Diag.w("档案同步: Provider 未确认，已发送显式副本广播 " + name);
+            Diag.w("档案同步: Provider 未确认，已发送显式副本广播 " + name + " bytes=" + data.length);
         } catch (Throwable error) { Diag.w("档案同步失败 " + name + " " + error); }
+    }
+
+    private static boolean pushViaProviderStream(Context c, File src, String uid, String name) {
+        try {
+            String token = UUID.randomUUID().toString().replace("-", "");
+            Uri stageUri = Uri.parse("content://" + ConfigProvider.AUTHORITY + "/archive_stage/" + token);
+            OutputStream raw = c.getContentResolver().openOutputStream(stageUri, "w");
+            if (raw == null) return false;
+            long rawBytes = 0;
+            try {
+                GZIPOutputStream gz = new GZIPOutputStream(new BufferedOutputStream(raw));
+                try {
+                    InputStream in = new BufferedInputStream(new FileInputStream(src));
+                    try {
+                        byte[] buf = new byte[STREAM_BUF_SIZE];
+                        int n;
+                        while ((n = in.read(buf)) != -1) {
+                            rawBytes += n;
+                            if (rawBytes > MAX_ARCHIVE_BYTES) {
+                                throw new java.io.IOException("archive grew beyond 16MB during stream");
+                            }
+                            gz.write(buf, 0, n);
+                        }
+                    } finally { in.close(); }
+                } finally { gz.close(); }
+            } finally {
+                try { raw.close(); } catch (Throwable ignored) {}
+            }
+            if (rawBytes == 0) return false;
+            Bundle extras = new Bundle();
+            extras.putString("token", token);
+            extras.putString("uid", uid);
+            extras.putBoolean("gzip", true);
+            Bundle result = c.getContentResolver().call(ConfigProvider.URI, "commitFile", name, extras);
+            if (result != null && result.getBoolean("ok")) {
+                Diag.w("档案同步: FD流式已确认 " + name + " bytes=" + rawBytes + " scoped=" + (uid != null));
+                return true;
+            }
+        } catch (Throwable t) {
+            android.util.Log.w("fucklark", "档案 FD 流式推送失败 name=" + name, t);
+        }
+        return false;
     }
 
     public static void pushProfiles() { pushToModule("profiles.json"); }
@@ -110,7 +186,7 @@ public final class ArchiveSync {
         return legacy.isFile() ? legacy : null;
     }
 
-    /** 模块进程接收档案推送并落盘（manifest 注册）。 */
+    /** 模块进程接收小文件档案推送并落盘（manifest 注册）。 */
     public static class Receiver extends BroadcastReceiver {
         @Override public void onReceive(Context context, Intent intent) {
             try {
@@ -119,9 +195,8 @@ public final class ArchiveSync {
                 String name = intent.getStringExtra("name");
                 byte[] data = intent.getByteArrayExtra("data");
                 String uid = intent.getStringExtra("uid");
-                if (name == null || data == null || data.length == 0) return;
-                name = name.replace("..", "").replace("/", "_").replace("\\", "_");
-                if (!name.endsWith(".json") && !name.endsWith(".txt")) return;
+                if (name == null || !name.matches("[A-Za-z0-9_]+\\.(json|txt)")) return;
+                if (data == null || data.length == 0 || data.length > MAX_BROADCAST_RECV_BYTES) return;
                 ArchiveReplicaStore.save(context.getFilesDir(), uid, name, data);
                 android.util.Log.i("fucklark", "ArchiveSync.recv " + name + " bytes=" + data.length);
             } catch (Throwable t) {

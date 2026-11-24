@@ -3,18 +3,30 @@ package com.chekayo.feishuantirecall;
 import android.content.Context;
 import android.os.Bundle;
 
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/** Provider 内收集飞书进程心跳，用实际加载版本诊断未重启的旧模块。 */
+/** Provider 内收集飞书进程心跳，用实际加载版本与各宿主进程上报的锚点状态做诊断。 */
 final class RuntimeStatus {
+    private static final int MAX_PROCESSES = 32;
     private static final Map<String, Bundle> PROCESSES = new LinkedHashMap<String, Bundle>();
+
     static synchronized void report(Bundle info) {
         if (info == null || info.getString("process") == null) return;
+        String proc = info.getString("process");
         Bundle copy = new Bundle(info);
         copy.putLong("seenAt", System.currentTimeMillis());
-        PROCESSES.put(info.getString("process"), copy);
+        PROCESSES.remove(proc);
+        while (PROCESSES.size() >= MAX_PROCESSES) {
+            Iterator<String> it = PROCESSES.keySet().iterator();
+            if (!it.hasNext()) break;
+            it.next();
+            it.remove();
+        }
+        PROCESSES.put(proc, copy);
     }
+
     static synchronized String describe() {
         long authority = Config.updatedAt();
         StringBuilder out = new StringBuilder("已安装模块：v" + ModuleBuild.VERSION
@@ -32,12 +44,24 @@ final class RuntimeStatus {
             else if (age > 10) out.append("进程暂停或未运行，恢复运行后会自动同步。\n");
             else if (info.getLong("updatedAt") != authority) out.append("正在同步最新配置。\n");
             else out.append("版本与配置一致。\n");
+
+            String timeStatus = info.getString("timeStatus");
+            String recallStatus = info.getString("recallStatus");
+            String bubbleStatus = info.getString("bubbleStatus");
+            boolean hasNative = info.containsKey("nativeLoaded");
+            if (timeStatus != null || recallStatus != null || bubbleStatus != null || hasNative) {
+                out.append("消息时间：").append(timeStatus != null ? timeStatus : "未知")
+                        .append("\n防撤回身份：").append(recallStatus != null ? recallStatus : "未知")
+                        .append("\n撤回气泡：").append(bubbleStatus != null ? bubbleStatus : "未知")
+                        .append("\nnative 库：").append(hasNative
+                                ? (info.getBoolean("nativeLoaded", false) ? "已加载（实际 SQL 命中见日志）" : "未加载")
+                                : "未知")
+                        .append("\n");
+            }
         }
-        out.append("\n功能锚点状态：\n消息时间：").append(MessageTimeDisplay.status())
-                .append("\n防撤回身份：").append(RecallMessages.status())
-                .append("\n撤回气泡：").append(RecallBubbleUi.status()).append("\n");
         return out.toString();
     }
+
     static void show(final android.content.Context ctx) {
         final android.widget.TextView text = new android.widget.TextView(ctx);
         text.setText("正在读取同步状态…"); text.setTextColor(Ui.titleColor(ctx));
