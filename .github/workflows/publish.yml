@@ -35,6 +35,7 @@ jobs:
   publish:
     name: 构建签名并发布
     runs-on: ubuntu-latest
+    timeout-minutes: 45   # 防卡死长跑(此前 PR#15 出现 1.5h 挂起 run)
     environment: production
     permissions:
       contents: write      # Release/资产/版本文件回写
