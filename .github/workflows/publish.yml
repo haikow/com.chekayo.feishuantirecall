@@ -119,19 +119,26 @@ jobs:
           head -30 dist/RELEASE_NOTES.md
 
       - name: Publish (main repo)
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
-          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-            -t "${{ steps.meta.outputs.vn }} · $(python3 -c "import json;d=json.load(open('version.json'));print(d['changelog'].split(chr(10))[0].lstrip('· '))")" \
-            -F dist/RELEASE_NOTES.md \
-            ${{ steps.meta.outputs.line == 'api102' && '--prerelease' || '' }} || echo "release exists"
-          for i in 1 2 3 4 5; do gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*.apk && break; sleep $((i*2)); done
+          if ! gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+              -t "${{ steps.meta.outputs.vn }} · $(python3 -c "import json;d=json.load(open('version.json'));print(d['changelog'].split(chr(10))[0].lstrip('· '))")" \
+              -F dist/RELEASE_NOTES.md \
+              ${{ steps.meta.outputs.line == 'api102' && '--prerelease' || '' }}
+          fi
+          uploaded=0
+          for i in 1 2 3 4 5; do
+            if gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*.apk; then uploaded=1; break; fi
+            sleep $((i*2))
+          done
+          if [ "$uploaded" -ne 1 ]; then echo "APK upload failed after retries" >&2; exit 1; fi
 
       - name: Publish (market repo via PAT)
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ secrets.MARKET_PAT }}
         run: |
@@ -145,7 +152,7 @@ jobs:
           fi
 
       - name: Publish (Telegram dual-package)
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'push' || !inputs.dry_run }}
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         run: |
@@ -163,6 +170,6 @@ jobs:
           subject-path: 'dist/*.apk'
 
       - name: Dry-run summary
-        if: ${{ inputs.dry_run }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
           echo "DRY-RUN 完成：构建与验签已执行，发布步骤跳过(dry_run=true)"
