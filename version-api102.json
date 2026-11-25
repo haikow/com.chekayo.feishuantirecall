@@ -1,11 +1,11 @@
 {
-  "versionCode": 1036,
-  "versionName": "1.8.14-api102",
+  "versionCode": 1038,
+  "versionName": "1.8.16-api102",
   "channel": "https://t.me/fucklark",
-  "changelog": "· 修复同事档案与离职名单更新不同步：花名册状态合并后同步累计名单，并保留已有档案详情\n· 修复多账号档案副本写错目录及桌面副本过期；回到前台自动重试拉取并刷新人数\n· 优化离职名单刷新与累计记录合并，避免读取到旧账号副本\n· 优化会话滑动标为已读的请求与未读消息分页处理\n· 优化时间常驻锚点扫描，按宿主结构重新发现映射",
+  "changelog": "· 修复 1.8.15 更新后版本信息仍显示 1.8.14、重复提示更新的问题\n· 修复同事档案与离职名单更新不同步：花名册状态合并后同步累计名单，并保留已有档案详情\n· 修复多账号档案副本写错目录及桌面副本过期；回到前台自动重试拉取并刷新人数\n· 优化离职名单刷新与累计记录合并，避免读取到旧账号副本\n· 优化会话滑动标为已读的请求与未读消息分页处理\n· 优化时间常驻锚点扫描，按宿主结构重新发现映射",
   "downloads": [
-    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/latest",
+    "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/38-1.8.16",
     "https://t.me/fucklark"
   ],
-  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/latest"
+  "download": "https://github.com/haikow/com.chekayo.feishuantirecall/releases/tag/38-1.8.16"
 }
